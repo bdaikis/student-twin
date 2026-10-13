@@ -1,0 +1,121 @@
+/* Design tokens from voice-widget-spec v0.1 (Bhanu), written as plain CSS.
+   Tailwind equivalents in comments. */
+:root {
+  --panel: rgba(15, 23, 42, 0.92);        /* bg-slate-900/80 — opacity raised: no OS blur yet */
+  --panel-border: rgba(30, 41, 59, 0.5);  /* border-slate-800/50 */
+  --text: #f1f5f9;                        /* text-slate-100 */
+  --muted: #94a3b8;                       /* text-slate-400 */
+  --accent: #4f46e5;                      /* bg-indigo-600 */
+  --accent-text: #818cf8;                 /* text-indigo-400 */
+  --card: rgba(30, 41, 59, 0.4);          /* bg-slate-800/40 */
+  --card-border: rgba(51, 65, 85, 0.3);   /* border-slate-700/30 */
+  --input-bg: rgba(2, 6, 23, 0.6);        /* bg-slate-950/60 */
+  --input-text: #e2e8f0;                  /* text-slate-200 */
+  --placeholder: #64748b;                 /* placeholder-slate-500 */
+  --green: #22c55e;
+  --amber: #f59e0b;
+  --gray: #64748b;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; height: 100%;
+  background: transparent;
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  user-select: none;
+}
+
+.panel {
+  height: 100%;
+  display: flex; flex-direction: column;
+  background: var(--panel);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--panel-border);
+  border-right: none;
+  border-radius: 16px 0 0 16px;             /* rounded-l-2xl */
+  overflow: hidden;
+}
+
+.header {
+  height: 40px; flex: none;
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 8px 0 14px;
+  -webkit-app-region: drag;
+  border-bottom: 1px solid var(--card-border);
+}
+.title { font-weight: 600; letter-spacing: 0.01em; }
+.status { color: var(--muted); font-size: 12px; margin-left: auto; }
+.icon-btn {
+  -webkit-app-region: no-drag;
+  width: 28px; height: 28px; border: none; border-radius: 6px;
+  background: transparent; color: var(--muted); cursor: pointer; font-size: 14px;
+}
+.icon-btn:hover { background: var(--card); color: var(--text); }
+
+.dot { -webkit-app-region: no-drag; width: 10px; height: 10px; border-radius: 50%; cursor: pointer; flex: none; }
+.dot.idle { background: var(--gray); }
+.dot.listening { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.dot.working { background: var(--amber); }
+.dot.needs-you { background: var(--accent-text); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.35; transform: scale(0.8); } }
+
+.meter { height: 3px; flex: none; background: transparent; }
+.meter span { display: block; height: 100%; width: 0; background: var(--green); transition: width 60ms linear; }
+.meter.on { background: rgba(34, 197, 94, 0.12); }
+
+.conversation {
+  flex: 1 1 65%;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex; flex-direction: column; justify-content: flex-start;
+  user-select: text;
+}
+.conversation::-webkit-scrollbar { width: 6px; }
+.conversation::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 3px; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;                       /* rounded-lg */
+  padding: 12px;                            /* p-3 */
+  margin-bottom: 8px;                       /* mb-2 */
+  line-height: 1.45;
+}
+.card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+.card .body { white-space: pre-wrap; word-wrap: break-word; }
+.card .body code { background: var(--input-bg); padding: 1px 4px; border-radius: 4px; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
+.card .body.streaming::after { content: "▍"; color: var(--accent-text); animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.card.hint { background: transparent; border-style: dashed; color: var(--muted); }
+.card.error { border-color: rgba(245, 158, 11, 0.5); }
+.card.error .label { color: var(--amber); }
+.card.you { border-left: 2px solid var(--accent-text); }
+.card.action .label { color: var(--green); }
+.card.confirm { border-color: rgba(129, 140, 248, 0.5); }
+.actions { display: flex; gap: 8px; margin-top: 10px; }
+.btn { border: none; border-radius: 6px; padding: 6px 14px; cursor: pointer; font: inherit; }
+.btn.primary { background: var(--accent); color: white; }
+.btn.secondary { background: transparent; color: var(--muted); border: 1px solid var(--card-border); }
+.btn:hover { filter: brightness(1.15); }
+
+.today {
+  flex: 0 0 auto; max-height: 15%;
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--card-border);
+  overflow: hidden;
+}
+.today-head { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+.today-item { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+.today-item .when { color: var(--accent-text); white-space: nowrap; }
+.today-item.pending .what { color: var(--amber); }
+
+.input-bar { flex: none; background: var(--input-bg); padding: 10px 14px; }
+#input {
+  width: 100%; resize: none; border: none; outline: none;
+  background: transparent; color: var(--input-text);
+  font: inherit; line-height: 1.4; max-height: 90px;
+}
+#input::placeholder { color: var(--placeholder); }

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'">
+  <title>Student Twin</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="panel">
+    <header class="header">
+      <span id="dot" class="dot idle" title="Status (click to preview states)"></span>
+      <span class="title">Student Twin</span>
+      <span id="status" class="status">Idle</span>
+      <button id="hide" class="icon-btn" title="Hide — rest the mouse on the top edge above to bring it back">&#x2014;</button>
+    </header>
+    <div id="meter" class="meter" aria-hidden="true"><span></span></div>
+
+    <main id="conversation" class="conversation" aria-live="polite"></main>
+
+    <section class="today" aria-label="Today">
+      <div class="today-head">Today</div>
+      <div id="today-list"></div>
+    </section>
+
+    <footer class="input-bar">
+      <textarea id="input" rows="1" placeholder="Type, or hold numpad . to talk"></textarea>
+    </footer>
+  </div>
+  <script src="renderer.js"></script>
+</body>
+</html>

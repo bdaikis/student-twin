@@ -1,0 +1,14 @@
+{
+  "name": "student-twin-widget",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Floating push-to-talk command widget for Student Twin (slice 2).",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "electron": "44.7.0"
+  }
+}

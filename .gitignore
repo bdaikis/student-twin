@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Local configuration, secrets and user data never belong in the repo
+.env
+*.env
+config.local.*
+secrets/
+data/
+logs/
+*.jsonl
+*.sqlite
+*.db
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

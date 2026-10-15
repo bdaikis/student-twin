@@ -8,6 +8,7 @@ windows (closing asks the program, as its X button does, so it can still offer t
 actions (deleting, uninstalling, paying, submitting) are not in this server; they go through the
 confirm card (step 2d-ii).
 
+Course contents come from the portal's Moodle API through moodle.py (read-only allowlist).
 Per-user settings (course pages, browser profiles, default music, home city) come from
 %LOCALAPPDATA%\\student-twin\\config.json.
 Runs in the isolated student-twin venv: mcp, winrt-Windows.Media.Control, uiautomation.
@@ -24,7 +25,7 @@ import time
 import urllib.request
 import winreg
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from mcp.server.mcpserver import MCPServer
 
@@ -34,7 +35,11 @@ server = MCPServer(
     "desktop",
     instructions=(
         "Direct actions on Bhanu's Windows computer. Prefer these over screen control: they are fast "
-        "and reliable. Use the weather tool for weather, rain and air quality; web search for other facts."
+        "and reliable. Use the weather tool for weather, rain and air quality; web search for other facts. "
+        "For anything posted in a course (notes, slides, lectures, tutorials) use course_materials and "
+        "open_course_item. Spoken commands arrive as speech-recognition transcripts and can mishear "
+        "names: when a name matches nothing, check list_windows and ask whether Bhanu meant the "
+        "closest-sounding window or app, naming it."
     ),
 )
 
@@ -105,7 +110,45 @@ def _open_web(url: str) -> str:
                                   and before.get(w["hwnd"]) != w["title"]), None), 6)
     if win is None:
         return f"Opened {url} in {where}, but couldn't find its window to bring forward."
-    return f"Opened {url} in {where}" + ("." if _focus(win["hwnd"]) else ", but Windows didn't let me bring it to the front.")
+    focused = _focus(win["hwnd"])
+    # While the page loads the window is titled "Untitled" or "New Tab"; wait for the real title so
+    # later commands (arrange, maximize, close tab) can find the window by the page's name.
+    title = _wait_for(lambda: (lambda t: t if t and not _loading_title(t, url) else None)(_window_title(win["hwnd"])), 8)
+    title = title or _window_title(win["hwnd"])
+    return (f"Opened {url} in {where}" + ("" if focused else ", but Windows didn't let me bring it to the front")
+            + f". Its window is titled {title!r}.")
+
+
+def _window_title(hwnd) -> str:
+    n = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(n + 1)
+    user32.GetWindowTextW(hwnd, buf, n + 1)
+    return buf.value
+
+
+def _loading_title(title: str, url: str) -> bool:
+    page = re.sub(r"\s+-\s+(Google Chrome|Microsoft​? Edge|Brave|Mozilla Firefox)$", "", title).strip()
+    host = urlparse(url).hostname or ""
+    # A PDF first shows its address ("host/path/file.pdf") and then the title stored in the PDF.
+    # Redirect pages carry placeholder titles: Moodle's file links show "Working...", PyTorch's docs "Redirecting…".
+    return (page.lower().rstrip(".… ") in ("", "untitled", "new tab", "loading", "working", "redirecting",
+                                           "please wait", "about:blank")
+            or page.startswith(("http:", "https:")) or page == host or (bool(host) and page.startswith(host + "/")))
+
+
+def _match_course(course: str) -> tuple[str, dict] | str:
+    """(code, info) for a course code ("SIF1014") or part of its name ("thermal physics"), or an
+    error sentence listing the courses."""
+    courses = _config().get("courses", {})
+    q = _norm(course).replace(" ", "")
+    for code, info in courses.items():
+        if q and (q == code.lower() or q in code.lower()):
+            return code, info
+    hits = [code for code, info in courses.items() if _norm(course) and _norm(course) in _norm(info["name"])]
+    if len(hits) == 1:
+        return hits[0], courses[hits[0]]
+    known = ", ".join(f"{c} ({i['name']})" for c, i in courses.items())
+    return f"No single course matches {course!r}. Courses: {known}."
 
 
 @server.tool()
@@ -131,19 +174,92 @@ def open_portal() -> str:
 @server.tool()
 def open_course(course: str) -> str:
     """Open a course's page on the university portal, where its notes and slides are posted.
-    `course` is a course code such as "SIF1014" or part of a course name such as "thermal physics"."""
-    courses = _config().get("courses", {})
-    q = _norm(course).replace(" ", "")
-    for code, info in courses.items():
-        if q == code.lower() or q in code.lower():
-            return f"{code} {info['name']}: " + _open_web(info["url"])
-    by_name = {code: _norm(info["name"]) for code, info in courses.items()}
-    hits = [code for code, name in by_name.items() if _norm(course) and _norm(course) in name]
-    if len(hits) == 1:
-        info = courses[hits[0]]
-        return f"{hits[0]} {info['name']}: " + _open_web(info["url"])
-    known = ", ".join(f"{c} ({i['name']})" for c, i in courses.items())
-    return f"No single course matches {course!r}. Courses: {known}."
+    `course` is a course code such as "SIF1014" or part of a course name such as "thermal physics".
+    To open a specific lecture, file or assignment inside the course, use open_course_item instead."""
+    match = _match_course(course)
+    if isinstance(match, str):
+        return match
+    code, info = match
+    return f"{code} {info['name']}: " + _open_web(info["url"])
+
+
+def _moodle():
+    from moodle import Moodle  # imported lazily: only the course tools need it
+    portal = _config().get("portal", {})
+    global _moodle_client
+    if _moodle_client is None or _moodle_client.site != portal.get("url", "").rstrip("/"):
+        _moodle_client = Moodle(portal["url"], portal.get("token_credential", "student-twin/spectrum-token"))
+    return _moodle_client
+
+
+_moodle_client = None
+
+
+def _course_contents(course: str):
+    """(code, info, sections) or an error sentence."""
+    match = _match_course(course)
+    if isinstance(match, str):
+        return match
+    code, info = match
+    course_id = parse_qs(urlparse(info["url"]).query).get("id", [None])[0]
+    if not course_id or not _config().get("portal", {}).get("url"):
+        return f"{code} has no portal course id or the portal isn't configured."
+    from moodle import MoodleError
+    try:
+        return code, info, _moodle().course_contents(int(course_id))
+    except MoodleError as exc:
+        return f"Couldn't read {code} from the portal: {exc}."
+
+
+@server.tool()
+def course_materials(course: str) -> str:
+    """List what is posted in a course on the university portal: lecture notes, slides, files,
+    folders, links, assignments and quizzes, section by section. Read-only. Use it to answer what is
+    in a course or to find the exact name of an item before open_course_item."""
+    got = _course_contents(course)
+    if isinstance(got, str):
+        return got
+    code, info, sections = got
+    lines = [f"{code} {info['name']}:"]
+    for sec in sections:
+        lines.append(f"## {sec['name']}")
+        for m in sec["modules"]:
+            files = f" (files: {', '.join(m['files'][:5])}{', …' if len(m['files']) > 5 else ''})" if m["files"] else ""
+            lines.append(f"- [{m['type']}] {m['name']}{files}")
+    text = "\n".join(lines)
+    return text if len(text) <= 6000 else text[:6000] + "\n… (list cut short)"
+
+
+@server.tool()
+def open_course_item(course: str, item: str) -> str:
+    """Open one item inside a course on the university portal (a lecture's notes or slides, a file,
+    folder, link, assignment or quiz page) in the browser profile where Bhanu is signed in, and bring
+    it to the front. `item` is part of the item's name, e.g. "Lecture 1", "Tutorial 2", "Course info".
+    If several items match, nothing is opened and the candidates are returned."""
+    got = _course_contents(course)
+    if isinstance(got, str):
+        return got
+    code, info, sections = got
+    q = _norm(item)
+    if not q:
+        return "Say which item to open."
+    items = [(sec["name"], m) for sec in sections for m in sec["modules"] if m.get("url")]
+    # Whole words, so "Lecture 1" doesn't also match "Lecture 10"; a file name inside the item counts too.
+    pattern = re.compile(rf"(^| ){re.escape(q)}($| )")
+    hits = [(s, m) for s, m in items if pattern.search(_norm(m["name"]))]
+    hits = hits or [(s, m) for s, m in items if any(pattern.search(_norm(f)) for f in m["files"])]
+    # Then shortened words: "course info" finds "Course Information".
+    words = q.split()
+    hits = hits or [(s, m) for s, m in items
+                    if all(any(w.startswith(qw) for w in _norm(m["name"]).split()) for qw in words)]
+    if not hits:
+        close = difflib.get_close_matches(q, [_norm(m["name"]) for _, m in items], n=5, cutoff=0.5)
+        hint = f" Closest: {'; '.join(close)}." if close else " Use course_materials to see what's posted."
+        return f"Nothing in {code} is called {item!r}.{hint}"
+    if len(hits) > 1:
+        return f"Several items in {code} match {item!r}: " + "; ".join(f"{m['name']} ({s})" for s, m in hits[:8]) + ". Say which."
+    sec, m = hits[0]
+    return f"{code} › {sec} › {m['name']}: " + _open_web(m["url"])
 
 
 _apps_cache: list[dict] = []
@@ -368,8 +484,24 @@ class MOUSEINPUT(ctypes.Structure):
                 ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
 
 
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD), ("dwFlags", wt.DWORD), ("time", wt.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
+
+
 class INPUT(ctypes.Structure):
-    _fields_ = [("type", wt.DWORD), ("mi", MOUSEINPUT)]
+    _fields_ = [("type", wt.DWORD), ("u", _INPUTUNION)]
+
+
+def _press_ctrl(vk: int) -> None:
+    """Ctrl+<key> through SendInput."""
+    keys = [(0x11, 0), (vk, 0), (vk, 2), (0x11, 2)]  # VK_CONTROL down, key down, key up, Ctrl up (KEYEVENTF_KEYUP)
+    arr = (INPUT * len(keys))(*[INPUT(type=1, u=_INPUTUNION(ki=KEYBDINPUT(wVk=v, dwFlags=f))) for v, f in keys])
+    user32.SendInput(len(keys), arr, ctypes.sizeof(INPUT))
 
 
 def _focus(hwnd) -> bool:
@@ -402,11 +534,14 @@ def _focus(hwnd) -> bool:
 def window(name: str, action: str = "focus") -> str:
     """Bring an open window to the front or change it. `name` is part of its title or its program
     ("Minecraft", "VS Code", "PyTorch", "Spotify"). `action`: focus (bring to the front), maximize,
-    minimize, restore, or close (asks the program to close, as its X button does, so it can still
-    offer to save work)."""
-    act = action.strip().lower()
-    if act not in ("focus", "maximize", "minimize", "restore", "close"):
-        return "Unknown action; use focus, maximize, minimize, restore or close."
+    minimize, restore, close (asks the program to close, as its X button does, so it can still
+    offer to save work), or close_tab (closes one browser tab and leaves the window's other tabs open;
+    `name` is part of the tab's page title, and it works on the tab showing in front of its window)."""
+    act = action.strip().lower().replace(" ", "_")
+    if act not in ("focus", "maximize", "minimize", "restore", "close", "close_tab"):
+        return "Unknown action; use focus, maximize, minimize, restore, close or close_tab."
+    if act == "close_tab":
+        return _close_tab(name)
     hits = _find_windows(name, loose=act != "close")
     if not hits:
         return f"Couldn't find a window for {name!r}. Use list_windows to see what's open."
@@ -424,6 +559,25 @@ def window(name: str, action: str = "focus") -> str:
     focused = _focus(win["hwnd"])
     done = {"focus": "Brought {} to the front", "maximize": "Maximized {}", "restore": "Restored {}"}[act]
     return done.format(win["title"]) + ("." if focused else ", but Windows didn't let me bring it to the front.")
+
+
+def _close_tab(name: str) -> str:
+    # A browser window's title is the page title of its front tab, so a title match is that tab.
+    q = _norm(name)
+    hits = [w for w in _windows() if w["process"].lower() in BROWSERS and q and q in _norm(w["title"])]
+    if not hits:
+        return (f"No browser window is showing a tab called {name!r} in front. Only the tab in front "
+                "of each window can be closed; bring the tab forward first.")
+    if len(hits) > 1:
+        return "Several browser windows match; say which tab: " + "; ".join(w["title"] for w in hits[:8]) + "."
+    win = hits[0]
+    if not _focus(win["hwnd"]):
+        return f"Windows didn't let me bring {win['title']} to the front, so no tab was closed."
+    # Check again right before the keystroke, so Ctrl+W can only ever reach this window.
+    if user32.GetForegroundWindow() != win["hwnd"]:
+        return "Another window took the front before the tab could be closed; nothing was closed."
+    _press_ctrl(0x57)  # Ctrl+W
+    return f"Closed the tab {win['title']}."
 
 
 def _place(hwnd, rect):

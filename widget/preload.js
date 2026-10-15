@@ -15,4 +15,7 @@ contextBridge.exposeInMainWorld('twin', {
   onTranscript: (cb) => ipcRenderer.on('voice:transcript', (_e, m) => cb(m)),
   onVoiceStatus: (cb) => ipcRenderer.on('voice:status', (_e, m) => cb(m)),
   onVisibility: (cb) => ipcRenderer.on('visibility', (_e, visible) => cb(visible)),
+  onConfirm: (cb) => ipcRenderer.on('confirm:show', (_e, m) => cb(m)),
+  onConfirmGone: (cb) => ipcRenderer.on('confirm:gone', (_e, m) => cb(m)),
+  answerConfirm: (id, decision) => ipcRenderer.send('confirm:answer', { id, decision }),
 });

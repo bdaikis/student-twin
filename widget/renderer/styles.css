@@ -96,6 +96,16 @@ html, body {
 .card.you .tick { color: var(--green); text-transform: none; letter-spacing: 0; }
 .card.action .label { color: var(--green); }
 .card.confirm { border-color: rgba(129, 140, 248, 0.5); }
+.card.confirm .label { color: var(--accent-text); }
+.card.confirm .details { margin: 6px 0 0; padding-left: 16px; color: var(--muted); font-size: 12px; }
+.card.confirm .buttons { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.card.confirm button { font: inherit; font-size: 12px; padding: 4px 12px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--card-border); background: var(--input-bg); color: var(--text); }
+.card.confirm button.confirm-btn { background: var(--accent); border-color: var(--accent); }
+.card.confirm button:disabled { opacity: 0.4; cursor: default; }
+.card.confirm .countdown { margin-left: auto; color: var(--muted); font-size: 11px; }
+.card.confirm.settled { border-color: var(--card-border); }
+.card.confirm.settled .label { color: var(--muted); }
 .actions { display: flex; gap: 8px; margin-top: 10px; }
 .btn { border: none; border-radius: 6px; padding: 6px 14px; cursor: pointer; font: inherit; }
 .btn.primary { background: var(--accent); color: white; }

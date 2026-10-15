@@ -158,10 +158,11 @@ const DONE_MARK = '✓';
 const WIDGET_RULES = [
   "You are answering through Bhanu's desktop widget. Requests arrive typed or as speech-recognition",
   'transcripts, which can mishear names and short commands.',
-  `When a request is a command (open, close, play, pause, arrange, focus, minimize and the like) and every action it needed succeeded exactly as asked, reply with only the single character ${DONE_MARK} and nothing else; the widget shows a tick instead of text.`,
+  `When a request is a command (open, close, play, pause, arrange, focus, minimize, delete and the like) and every action it needed succeeded exactly as asked, reply with only the single character ${DONE_MARK} and nothing else; the widget shows a tick instead of text. This includes an irreversible action he confirmed on the card: a successful delete also gets only ${DONE_MARK}.`,
   'Reply in words instead when an action failed or only partly worked, when you had to guess what he meant (say what you assumed), when you need to ask him something, or when he asked for information such as the weather, what is posted in a course, or what a page says.',
   "Prefer the desktop tools over screen control. Use the weather tool for weather, rain and air quality, and web search for other facts. For anything posted in a course use course_materials and open_course_item.",
   'When a window or app name matches nothing, check list_windows and ask whether he meant the closest-sounding one, naming it.',
+  "Irreversible tools such as delete_files show him a confirm card themselves and wait for his click: call them directly, without asking for confirmation in chat, and never retry one he cancelled. Never claim something was deleted unless the tool result says so.",
 ].join(' ');
 
 // Stream one answer from Hermes, forwarding text deltas to the renderer as they arrive.
@@ -280,6 +281,59 @@ function transcribeWav(id, wavBytes) {
   helper.stdin.write(`${JSON.stringify({ cmd: 'transcribe', id, path: file })}\n`);
 }
 
+// --- Confirm card (step 2d-ii) ------------------------------------------------------------------
+// Irreversible tools write a request to <data>/confirm/pending and wait (mcp_servers/confirm.py).
+// This process shows it as a card and writes the answer with the request's nonce; the nonce never
+// reaches the page or the model. widget.alive tells the tools a widget is here to answer.
+const TWIN_DATA = process.env.STUDENT_TWIN_HOME || path.join(process.env.LOCALAPPDATA, 'student-twin');
+const CONFIRM_DIR = path.join(TWIN_DATA, 'confirm');
+const PENDING_DIR = path.join(CONFIRM_DIR, 'pending');
+const ANSWERS_DIR = path.join(CONFIRM_DIR, 'answers');
+const ALIVE_FILE = path.join(CONFIRM_DIR, 'widget.alive');
+const confirmShown = new Map(); // request id -> nonce
+
+function touchAlive() {
+  try {
+    fs.mkdirSync(CONFIRM_DIR, { recursive: true });
+    fs.writeFileSync(ALIVE_FILE, String(process.pid));
+  } catch {}
+}
+
+function pollConfirm() {
+  let names = [];
+  try { names = fs.readdirSync(PENDING_DIR).filter((n) => n.endsWith('.json')); } catch {}
+  const present = new Set();
+  for (const name of names) {
+    const id = name.slice(0, -5);
+    present.add(id);
+    if (confirmShown.has(id)) continue;
+    let req;
+    try { req = JSON.parse(fs.readFileSync(path.join(PENDING_DIR, name), 'utf8')); } catch { continue; }
+    if (req.id !== id || !req.nonce) continue;
+    confirmShown.set(id, req.nonce);
+    showWidget();
+    toRenderer('confirm:show', {
+      id, summary: String(req.summary), details: (req.details || []).map(String),
+      action: String(req.action || 'Confirm'), expires: Number(req.expires) * 1000,
+    });
+  }
+  // A request the tool has removed (answered, timed out, or its server stopped) leaves the screen.
+  for (const id of [...confirmShown.keys()]) {
+    if (!present.has(id)) { confirmShown.delete(id); toRenderer('confirm:gone', { id }); }
+  }
+}
+
+function answerConfirm(id, decision) {
+  const nonce = confirmShown.get(id);
+  if (!nonce) return;
+  try {
+    fs.mkdirSync(ANSWERS_DIR, { recursive: true });
+    const file = path.join(ANSWERS_DIR, `${id}.json`);
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ nonce, decision: decision === 'confirm' ? 'confirm' : 'cancel' }));
+    fs.renameSync(`${file}.tmp`, file);
+  } catch {}
+}
+
 function trayIcon() {
   // 16x16 indigo dot, generated so the repo needs no binary asset for step 2a.
   const size = 16;
@@ -318,12 +372,17 @@ app.whenReady().then(() => {
   ipcMain.on('twin:ask', (e, { id, text }) => ask(e.sender, id, String(text).slice(0, 8000)));
   ipcMain.on('twin:cancel', (_e, { id }) => inflight.get(id)?.abort());
   ipcMain.on('mic:audio', (_e, { id, wav }) => transcribeWav(id, wav));
+  ipcMain.on('confirm:answer', (_e, { id, decision }) => answerConfirm(String(id), decision));
+  touchAlive();
+  setInterval(touchAlive, 5000);
+  setInterval(pollConfirm, 250);
 });
 
 // A tray app stays alive with its window hidden.
 app.on('window-all-closed', (e) => e.preventDefault());
 // Unhook the keyboard on exit, whatever the reason.
 app.on('will-quit', () => {
+  try { fs.rmSync(ALIVE_FILE, { force: true }); } catch {} // no widget left to answer a confirm card
   if (helper) { try { helper.stdin.write('{"cmd":"quit"}\n'); } catch {} helper.kill(); }
 });
 

@@ -70,12 +70,15 @@ window.twin.onDelta(({ id, text }) => {
 function finish(id) {
   const a = answers.get(id);
   if (a) a.el.querySelector('.body').classList.remove('streaming');
-  if (id === current) { current = null; setState('idle'); }
+  if (id === current) { current = null; settleState(); }
 }
 
 window.twin.onDone(({ id, cancelled }) => {
   const a = answers.get(id);
-  if (a && cancelled) a.el.querySelector('.label').textContent = 'Twin (stopped)';
+  if (a && cancelled) {
+    const label = a.el.querySelector('.label');
+    if (label.textContent !== 'Twin (interrupted)') label.textContent = 'Twin (stopped)';
+  }
   else if (a && isDoneMark(a.text)) {
     a.el.remove();
     const tick = document.createElement('span');
@@ -95,6 +98,96 @@ window.twin.onError(({ id, message }) => {
   }
   finish(id);
 });
+
+// --- Confirm card (step 2d-ii) ------------------------------------------------------------------
+// Shown when an irreversible tool is waiting. Nothing runs until Confirm; Cancel, Esc or the
+// 60-second limit cancels. The answer goes to the main process, which holds the request's nonce.
+const confirms = new Map(); // request id -> { el, timer, answered }
+
+function settleState() {
+  if (mic.live) setState('listening');
+  else if (confirms.size) setState('needs-you');
+  else setState(current ? 'working' : 'idle');
+}
+
+function closeConfirm(id, outcome) {
+  const c = confirms.get(id);
+  if (!c) return;
+  clearInterval(c.timer);
+  confirms.delete(id);
+  c.el.classList.add('settled');
+  c.el.querySelector('.label').textContent = outcome;
+  c.el.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+  c.el.querySelector('.countdown').remove();
+  settleState();
+}
+
+// Holding the push-to-talk key while the twin is working stops it, like Esc, and cancels any open
+// confirm card, so a new command can start at once.
+function interrupt() {
+  for (const id of [...confirms.keys()]) answer(id, 'cancel');
+  // A recording still being transcribed is superseded by the new one.
+  for (const [id, el] of heard) { el.remove(); heard.delete(id); superseded.add(id); }
+  if (current) {
+    const a = answers.get(current);
+    if (a) a.el.querySelector('.label').textContent = 'Twin (interrupted)';
+    window.twin.cancel(current);
+  }
+}
+
+function answer(id, decision) {
+  const c = confirms.get(id);
+  if (!c || c.answered) return;
+  c.answered = true;
+  window.twin.answerConfirm(id, decision);
+  closeConfirm(id, decision === 'confirm' ? 'Confirmed' : 'Cancelled');
+}
+
+window.twin.onConfirm(({ id, summary, details, action, expires }) => {
+  const el = card('confirm', 'Needs you', summary);
+  if (details.length) {
+    const list = document.createElement('ul');
+    list.className = 'details';
+    for (const d of details) {
+      const li = document.createElement('li');
+      li.textContent = d;
+      list.append(li);
+    }
+    el.append(list);
+  }
+  const row = document.createElement('div');
+  row.className = 'buttons';
+  const ok = document.createElement('button');
+  ok.className = 'confirm-btn';
+  ok.textContent = action;
+  ok.onclick = () => answer(id, 'confirm');
+  const no = document.createElement('button');
+  no.textContent = 'Cancel';
+  no.onclick = () => answer(id, 'cancel');
+  const countdown = document.createElement('span');
+  countdown.className = 'countdown';
+  row.append(ok, no, countdown);
+  el.append(row);
+  const tick = () => {
+    const left = Math.max(0, Math.round((expires - Date.now()) / 1000));
+    countdown.textContent = `${left} s`;
+    // The tool gives up at the same moment; an answer written now would never be read.
+    if (left === 0) closeConfirm(id, 'Timed out');
+  };
+  confirms.set(id, { el, timer: setInterval(tick, 1000), answered: false });
+  tick();
+  conv.scrollTop = conv.scrollHeight;
+  settleState();
+});
+
+// The tool stopped waiting (answered, timed out or its server restarted).
+window.twin.onConfirmGone(({ id }) => closeConfirm(id, 'Closed'));
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || !confirms.size) return;
+  e.stopImmediatePropagation(); // Esc cancels the card, not the answer being streamed
+  for (const id of [...confirms.keys()]) answer(id, 'cancel');
+}, true);
 
 function today(items) {
   const list = document.getElementById('today-list');
@@ -192,13 +285,14 @@ function toWav16k(chunks, rate) {
 }
 
 const heard = new Map(); // transcription id -> card element
+const superseded = new Set(); // transcriptions dropped because a newer hold interrupted them
 
 window.twin.onMic(async (action) => {
   try {
     if (action === 'prepare') {
-      if (!current) await micOpen();
+      await micOpen(); // also while the twin is working: a hold interrupts it
     } else if (action === 'start') {
-      if (current) return; // one request at a time
+      interrupt();
       await micOpen();
       mic.live = true;
       meter.classList.add('on');
@@ -225,6 +319,7 @@ window.twin.onMic(async (action) => {
 });
 
 window.twin.onTranscript(({ id, ok, text, error }) => {
+  if (superseded.delete(id)) return;
   const placeholder = heard.get(id);
   heard.delete(id);
   if (placeholder) placeholder.remove();

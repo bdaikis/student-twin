@@ -3,10 +3,10 @@
 An MCP server Hermes starts over stdio. Enabled for the desktop widget and the local CLI only,
 never for Telegram (platform_toolsets.telegram includes `no_mcp`).
 
-Every tool here is reversible: opening things, media controls, moving, focusing and closing
-windows (closing asks the program, as its X button does, so it can still offer to save). Irreversible
-actions (deleting, uninstalling, paying, submitting) are not in this server; they go through the
-confirm card (step 2d-ii).
+Most tools here are reversible: opening things, media controls, moving, focusing and closing
+windows (closing asks the program, as its X button does, so it can still offer to save), listing
+files. Irreversible ones (step 2d-ii: delete_files) act only after Bhanu clicks Confirm on the
+widget's confirm card; see confirm.py.
 
 Course contents come from the portal's Moodle API through moodle.py (read-only allowlist).
 Per-user settings (course pages, browser profiles, default music, home city) come from
@@ -668,6 +668,158 @@ def weather(place: str = "") -> str:
                  f"PM2.5 {air['pm2_5']:.0f} µg/m³. This is a model estimate (CAMS via Open-Meteo), not an "
                  "official station reading such as Malaysia's API index.")
     return text + " Source: Open-Meteo."
+
+
+# --- Files (step 2d-ii): listing is read-only; deleting waits for the confirm card ---------------
+
+_KNOWN_FOLDERS = {  # Windows known-folder IDs, so redirected folders (e.g. to OneDrive) resolve
+    "downloads": "{374DE290-123F-4565-9164-39C4925E467B}",
+    "desktop": "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}",
+    "documents": "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+    "pictures": "{33E28130-4E1E-4676-835A-98395C3BC3BB}",
+    "videos": "{18989B1D-99B5-455B-841C-AB7C74E4DDFC}",
+    "music": "{4BD8D571-6D19-48D3-BE97-422220080E43}",
+}
+_MAX_DELETE = 500
+
+
+def _known_folder(guid: str) -> Path | None:
+    class GUID(ctypes.Structure):
+        _fields_ = [("d1", wt.DWORD), ("d2", wt.WORD), ("d3", wt.WORD), ("d4", ctypes.c_ubyte * 8)]
+    g = GUID()
+    ctypes.oledll.ole32.CLSIDFromString(guid, ctypes.byref(g))
+    out = ctypes.c_wchar_p()
+    try:
+        ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(out))
+        return Path(out.value) if out.value else None
+    finally:
+        ctypes.windll.ole32.CoTaskMemFree(out)
+
+
+def _protected() -> list[Path]:
+    """Folders the file tools never touch: app data, the twin's own code and data, and any folders
+    listed under `protected_folders` in the twin's config."""
+    home = Path.home()
+    fixed = [home / "AppData", Path(__file__).resolve().parents[1], CONFIG_PATH.parent]
+    return [p.resolve() for p in fixed] + [Path(p).expanduser().resolve()
+                                           for p in _config().get("protected_folders", [])]
+
+
+def _resolve_folder(folder: str) -> Path | str:
+    """The folder as a resolved path inside Bhanu's user folder, or a refusal sentence."""
+    name = folder.strip().strip('"')
+    guid = _KNOWN_FOLDERS.get(name.lower().removeprefix("my ").strip())
+    path = _known_folder(guid) if guid else Path(os.path.expandvars(name)).expanduser()
+    if path is None:
+        return f"Couldn't find the {name} folder."
+    if not path.is_absolute():
+        path = Path.home() / path
+    path = path.resolve()
+    home = Path.home().resolve()
+    if not path.is_relative_to(home):
+        return f"Refused: {path} is outside your user folder."
+    if any(part.startswith(".") for part in path.relative_to(home).parts):
+        return f"Refused: {path} is a hidden settings folder."
+    for p in _protected():
+        if path.is_relative_to(p):
+            return f"Refused: {path} is inside a protected folder ({p})."
+    if not path.is_dir():
+        return f"No folder at {path}."
+    return path
+
+
+def _matches(folder: Path, pattern: str, recursive: bool, older_than_days: float | None) -> list[Path]:
+    files = (folder.rglob if recursive else folder.glob)(pattern or "*")
+    cutoff = time.time() - older_than_days * 86400 if older_than_days else None
+    protected = _protected()
+    out = []
+    for f in files:
+        try:
+            # A folder may contain protected or hidden ones (Desktop holds the OneDrive vault): skip them.
+            inside = f.relative_to(folder).parts[:-1]
+            if any(part.startswith(".") for part in inside) or any(f.is_relative_to(p) for p in protected):
+                continue
+            if f.is_file() and (cutoff is None or f.stat().st_mtime < cutoff):
+                out.append(f)
+        except OSError:
+            pass
+    return sorted(out, key=lambda f: f.stat().st_mtime, reverse=True)
+
+
+def _size(n: float) -> str:
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+@server.tool()
+def list_files(folder: str, pattern: str = "*", recursive: bool = False) -> str:
+    """List files in a folder, newest first, with sizes and dates. `folder` is Downloads, Desktop,
+    Documents, Pictures, Videos, Music, or a path inside Bhanu's user folder. `pattern` is a
+    wildcard such as "*.zip" or "Screenshot*". Read-only."""
+    path = _resolve_folder(folder)
+    if isinstance(path, str):
+        return path
+    files = _matches(path, pattern, recursive, None)
+    if not files:
+        return f"No files in {path} match {pattern!r}."
+    lines = [f"- {f.relative_to(path)} ({_size(f.stat().st_size)}, "
+             f"{time.strftime('%d %b %Y %H:%M', time.localtime(f.stat().st_mtime))})" for f in files[:40]]
+    more = f"\n…and {len(files) - 40} more." if len(files) > 40 else ""
+    return f"{len(files)} file(s) in {path} matching {pattern!r}:\n" + "\n".join(lines) + more
+
+
+def _recycle(paths: list[Path]) -> int:
+    """Send files to the Recycle Bin. Returns the shell's error code (0 = success)."""
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wt.HWND), ("wFunc", wt.UINT), ("pFrom", ctypes.c_void_p),
+                    ("pTo", ctypes.c_void_p), ("fFlags", ctypes.c_uint16),
+                    ("fAnyOperationsAborted", wt.BOOL), ("hNameMappings", ctypes.c_void_p),
+                    ("lpszProgressTitle", wt.LPCWSTR)]
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 0x4, 0x10, 0x40, 0x400
+    buf = ctypes.create_unicode_buffer("\0".join(str(p) for p in paths) + "\0\0")  # double-null list
+    op = SHFILEOPSTRUCTW(wFunc=FO_DELETE, pFrom=ctypes.cast(buf, ctypes.c_void_p),
+                         fFlags=FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI)
+    return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+
+
+@server.tool()
+async def delete_files(folder: str, pattern: str, recursive: bool = False,
+                       older_than_days: float | None = None) -> str:
+    """Move files to the Recycle Bin, after Bhanu confirms on the widget's confirm card. The tool
+    shows the card itself and waits up to 60 s: never ask him to confirm in chat first, and don't
+    retry after a cancel. `folder` as in list_files; `pattern` a wildcard ("*.zip", "*" for every
+    file); `older_than_days` keeps newer files. Files only, never folders."""
+    path = _resolve_folder(folder)
+    if isinstance(path, str):
+        return path
+    if not pattern.strip():
+        return "Give a pattern, e.g. \"*.zip\", or \"*\" for every file in the folder."
+    files = _matches(path, pattern, recursive, older_than_days)
+    if not files:
+        return f"No files in {path} match {pattern!r}; nothing to delete."
+    if len(files) > _MAX_DELETE:
+        return f"{len(files)} files match; the limit is {_MAX_DELETE} at once. Narrow the pattern."
+    sizes = [f.stat().st_size for f in files]
+    where = path.name or str(path)
+    summary = f"Move {len(files)} file{'s' if len(files) != 1 else ''} in {where} to the Recycle Bin?"
+    details = [f"{f.relative_to(path)} · {_size(s)}" for f, s in zip(files[:8], sizes)]
+    if len(files) > 8:
+        details.append(f"…and {len(files) - 8} more")
+    details.append(f"Total {_size(sum(sizes))}")
+    if max(sizes) >= 1024 ** 3:
+        details.append("Files too large for the Recycle Bin are deleted permanently")
+    import confirm  # local module, imported lazily like moodle
+    decision = await confirm.ask(summary, details, action="Delete")
+    if decision != "confirm":
+        return confirm.OUTCOME[decision]
+    code = _recycle(files)
+    left = [f for f in files if f.exists()]
+    if code == 0 and not left:
+        return f"Moved {len(files)} file(s) from {path} to the Recycle Bin."
+    return (f"Moved {len(files) - len(left)} of {len(files)} file(s) to the Recycle Bin; "
+            f"{len(left)} could not be moved (shell error {code:#x}), e.g. {left[0].name if left else ''}.")
 
 
 if __name__ == "__main__":

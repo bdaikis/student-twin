@@ -34,8 +34,13 @@ function renderMarkdown(text) {
     .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
 }
 
-const answers = new Map(); // request id -> { el, text }
+const answers = new Map(); // request id -> { you, el, text }
 let current = null; // request id in flight
+
+// A command that succeeded as asked gets this reply alone (see WIDGET_RULES in main.js): the
+// answer card is dropped and the request's card gets a tick.
+const DONE_MARK = '✓';
+const isDoneMark = (text) => text.trim().replace(/\.$/, '') === DONE_MARK;
 
 function newId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -43,10 +48,10 @@ function newId() {
 
 function ask(text, label = 'You typed') {
   const id = newId();
-  card('you', label, text);
+  const you = card('you', label, text);
   const el = card('answer', 'Twin', '');
   el.querySelector('.body').classList.add('streaming');
-  answers.set(id, { el, text: '' });
+  answers.set(id, { you, el, text: '' });
   current = id;
   setState('working');
   window.twin.ask(id, text);
@@ -56,6 +61,8 @@ window.twin.onDelta(({ id, text }) => {
   const a = answers.get(id);
   if (!a) return;
   a.text += text;
+  // Hold back a reply that is still only the done mark, so it never flashes up as text.
+  if (DONE_MARK.startsWith(a.text.trim())) return;
   a.el.querySelector('.body').innerHTML = renderMarkdown(a.text);
   conv.scrollTop = conv.scrollHeight;
 });
@@ -69,6 +76,13 @@ function finish(id) {
 window.twin.onDone(({ id, cancelled }) => {
   const a = answers.get(id);
   if (a && cancelled) a.el.querySelector('.label').textContent = 'Twin (stopped)';
+  else if (a && isDoneMark(a.text)) {
+    a.el.remove();
+    const tick = document.createElement('span');
+    tick.className = 'tick';
+    tick.textContent = ' ✓ done';
+    a.you.querySelector('.label').append(tick);
+  }
   finish(id);
 });
 

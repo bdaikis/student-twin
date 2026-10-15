@@ -93,6 +93,7 @@ html, body {
 .card.error { border-color: rgba(245, 158, 11, 0.5); }
 .card.error .label { color: var(--amber); }
 .card.you { border-left: 2px solid var(--accent-text); }
+.card.you .tick { color: var(--green); text-transform: none; letter-spacing: 0; }
 .card.action .label { color: var(--green); }
 .card.confirm { border-color: rgba(129, 140, 248, 0.5); }
 .actions { display: flex; gap: 8px; margin-top: 10px; }

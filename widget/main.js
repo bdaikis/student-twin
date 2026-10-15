@@ -151,6 +151,19 @@ function explain(err) {
   return `Couldn't reach the twin (${err && err.message ? err.message : 'unknown error'}).`;
 }
 
+// Sent with every widget question as a system message. Hermes does not pass MCP server
+// instructions to the model, so the desktop guidance lives here; Telegram never sees it.
+// DONE_MARK must match the renderer's.
+const DONE_MARK = '✓';
+const WIDGET_RULES = [
+  "You are answering through Bhanu's desktop widget. Requests arrive typed or as speech-recognition",
+  'transcripts, which can mishear names and short commands.',
+  `When a request is a command (open, close, play, pause, arrange, focus, minimize and the like) and every action it needed succeeded exactly as asked, reply with only the single character ${DONE_MARK} and nothing else; the widget shows a tick instead of text.`,
+  'Reply in words instead when an action failed or only partly worked, when you had to guess what he meant (say what you assumed), when you need to ask him something, or when he asked for information such as the weather, what is posted in a course, or what a page says.',
+  "Prefer the desktop tools over screen control. Use the weather tool for weather, rain and air quality, and web search for other facts. For anything posted in a course use course_materials and open_course_item.",
+  'When a window or app name matches nothing, check list_windows and ask whether he meant the closest-sounding one, naming it.',
+].join(' ');
+
 // Stream one answer from Hermes, forwarding text deltas to the renderer as they arrive.
 async function ask(sender, id, text) {
   const controller = new AbortController();
@@ -163,7 +176,11 @@ async function ask(sender, id, text) {
     const res = await fetch(HERMES_URL, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ model: 'hermes-agent', stream: true, messages: [{ role: 'user', content: text }] }),
+      body: JSON.stringify({
+        model: 'hermes-agent',
+        stream: true,
+        messages: [{ role: 'system', content: WIDGET_RULES }, { role: 'user', content: text }],
+      }),
       signal: controller.signal,
     });
     if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });

@@ -35,7 +35,6 @@ let anchor = null; // { right, top }: the visible shape's top-right corner when 
 let shape = { w: REST, h: REST }; // last size the renderer asked for
 let dwellStart = null;
 let hideTimer = null; // "Hide for 1 hour"
-let placing = false; // true while this process moves the window, so 'moved' isn't read as a drag
 
 function defaultAnchor() {
   const { workArea } = screen.getPrimaryDisplay();
@@ -56,13 +55,11 @@ function boundsFor(w, h, at = anchor) {
 }
 
 function place(bounds) {
-  placing = true;
   win.setBounds(bounds); // one atomic call: separate move and resize calls flicker
   // Windows enforces a minimum window size (about 51 x 50 DIP at 150%) and grows a smaller window
   // to the right; move it left by the excess so the shape's right edge stays on the anchor.
   const got = win.getBounds();
   if (got.width > bounds.width + 1) win.setBounds({ ...got, x: bounds.x - (got.width - bounds.width) });
-  placing = false;
 }
 
 function createWindow() {
@@ -100,12 +97,6 @@ function createWindow() {
     place(boundsFor(REST, REST)); // applies the minimum-size correction from the start
     win.showInactive(); // never steal focus
   });
-  // A drag by the grip moves the anchor: the new spot is where it lives from now on.
-  win.on('moved', () => {
-    if (hidden || placing) return;
-    const b = win.getBounds();
-    anchor = { right: b.x + b.width - MARGIN, top: b.y + MARGIN };
-  });
   // Give focus back the moment Bhanu leaves the typing box for another app.
   win.on('blur', () => { win.setFocusable(false); toRenderer('focus-lost'); });
   screen.on('display-metrics-changed', reanchor);
@@ -142,17 +133,27 @@ function drag(on) {
   if (!win || hidden) return;
   if (on && !dragging) {
     const start = screen.getCursorScreenPoint();
+    // The size is fixed for the whole drag and only the position changes. Re-reading it each tick
+    // made the window grow while the button was held (getBounds came back slightly larger than
+    // the last setBounds at 150% scaling), and the widget crept right with no mouse movement.
     const b = win.getBounds();
+    const startAnchor = { ...anchor };
+    let last = { x: start.x, y: start.y };
     dragging = setInterval(() => {
       const p = screen.getCursorScreenPoint();
-      place({ ...win.getBounds(), x: b.x + p.x - start.x, y: b.y + p.y - start.y });
+      if (p.x === last.x && p.y === last.y) return; // nothing moved, nothing to do
+      last = p;
+      win.setBounds({ x: b.x + p.x - start.x, y: b.y + p.y - start.y, width: b.width, height: b.height });
+      anchor = { right: startAnchor.right + p.x - start.x, top: startAnchor.top + p.y - start.y };
     }, 16);
   } else if (!on && dragging) {
     clearInterval(dragging);
     dragging = null;
-    const b = win.getBounds();
-    anchor = { right: b.x + b.width - MARGIN, top: b.y + MARGIN };
-    place(boundsFor(shape.w, shape.h)); // pulls it back inside the work area if dropped past an edge
+    // Pull it back inside the work area if dropped past an edge; the anchor follows from the
+    // bounds asked for, not read back from Windows.
+    const nb = boundsFor(shape.w, shape.h);
+    place(nb);
+    anchor = { right: nb.x + nb.width - MARGIN, top: nb.y + MARGIN };
   }
 }
 

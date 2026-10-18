@@ -1,30 +1,26 @@
-// Widget renderer. Step 2b: typed questions go to the twin (Hermes) and answers stream back.
-// Voice (2c), actions and the confirm card (2d), and live Today data (slice 3) come later.
+// Widget renderer: typed and spoken requests go to the twin (Hermes) and answers stream back;
+// the confirm card guards irreversible tools. Redesign step 1 (2026-10-18): no title, status
+// words, labels, hint card or Today strip; the dot's shape carries the state.
 const conv = document.getElementById('conversation');
 const input = document.getElementById('input');
 const dot = document.getElementById('dot');
-const statusText = document.getElementById('status');
 
-const STATES = { idle: 'Idle', listening: 'Listening…', working: 'Working…', 'needs-you': 'Needs you' };
+const STATES = { idle: 'Idle', listening: 'Listening', working: 'Working', 'needs-you': 'Waiting for you' };
+let voiceStarting = true; // hollow idle dot until the speech model is loaded
 function setState(name) {
-  dot.className = `dot ${name}`;
-  statusText.textContent = STATES[name];
+  dot.className = `dot ${name}${name === 'idle' && voiceStarting ? ' starting' : ''}`;
+  dot.setAttribute('aria-label', STATES[name]);
 }
 
-function card(kind, label, text) {
+function add(kind, text = '') {
   const el = document.createElement('div');
-  el.className = `card ${kind}`;
-  const l = document.createElement('div');
-  l.className = 'label';
-  l.textContent = label;
-  const body = document.createElement('div');
-  body.className = 'body';
-  body.textContent = text;
-  el.append(l, body);
+  el.className = kind;
+  el.textContent = text;
   conv.append(el);
   conv.scrollTop = conv.scrollHeight;
   return el;
 }
+const showError = (text) => add('error', text);
 
 // Minimal, safe Markdown: escape everything, then allow **bold**, `code` and line breaks.
 function renderMarkdown(text) {
@@ -46,12 +42,11 @@ function newId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function ask(text, label = 'You typed') {
+function ask(text) {
   const id = newId();
-  const you = card('you', label, text);
-  const el = card('answer', 'Twin', '');
-  el.querySelector('.body').classList.add('streaming');
-  answers.set(id, { you, el, text: '' });
+  const you = add('you', text);
+  const el = add('answer streaming');
+  answers.set(id, { you, el, text: '', interrupted: false });
   current = id;
   setState('working');
   window.twin.ask(id, text);
@@ -63,28 +58,31 @@ window.twin.onDelta(({ id, text }) => {
   a.text += text;
   // Hold back a reply that is still only the done mark, so it never flashes up as text.
   if (DONE_MARK.startsWith(a.text.trim())) return;
-  a.el.querySelector('.body').innerHTML = renderMarkdown(a.text);
+  a.el.innerHTML = renderMarkdown(a.text.trimStart()); // replies often open with blank lines
   conv.scrollTop = conv.scrollHeight;
 });
 
 function finish(id) {
   const a = answers.get(id);
-  if (a) a.el.querySelector('.body').classList.remove('streaming');
+  if (a) a.el.classList.remove('streaming');
   if (id === current) { current = null; settleState(); }
 }
 
 window.twin.onDone(({ id, cancelled }) => {
   const a = answers.get(id);
   if (a && cancelled) {
-    const label = a.el.querySelector('.label');
-    if (label.textContent !== 'Twin (interrupted)') label.textContent = 'Twin (stopped)';
+    const note = document.createElement('span');
+    note.className = 'note';
+    note.textContent = a.interrupted ? 'Interrupted' : 'Stopped';
+    (a.text ? a.el : a.you).append(note);
   }
   else if (a && isDoneMark(a.text)) {
     a.el.remove();
     const tick = document.createElement('span');
     tick.className = 'tick';
-    tick.textContent = ' ✓ done';
-    a.you.querySelector('.label').append(tick);
+    tick.textContent = '✓';
+    tick.setAttribute('aria-label', 'done');
+    a.you.append(tick);
   }
   finish(id);
 });
@@ -92,9 +90,8 @@ window.twin.onDone(({ id, cancelled }) => {
 window.twin.onError(({ id, message }) => {
   const a = answers.get(id);
   if (a) {
-    a.el.classList.add('error');
-    a.el.querySelector('.label').textContent = 'Problem';
-    a.el.querySelector('.body').textContent = message;
+    a.el.className = 'error';
+    a.el.textContent = message;
   }
   finish(id);
 });
@@ -116,9 +113,11 @@ function closeConfirm(id, outcome) {
   clearInterval(c.timer);
   confirms.delete(id);
   c.el.classList.add('settled');
-  c.el.querySelector('.label').textContent = outcome;
   c.el.querySelectorAll('button').forEach((b) => { b.disabled = true; });
-  c.el.querySelector('.countdown').remove();
+  const word = document.createElement('span');
+  word.className = 'outcome';
+  word.textContent = outcome;
+  c.el.querySelector('.countdown').replaceWith(word);
   settleState();
 }
 
@@ -127,10 +126,10 @@ function closeConfirm(id, outcome) {
 function interrupt() {
   for (const id of [...confirms.keys()]) answer(id, 'cancel');
   // A recording still being transcribed is superseded by the new one.
-  for (const [id, el] of heard) { el.remove(); heard.delete(id); superseded.add(id); }
+  for (const id of heard) { heard.delete(id); superseded.add(id); }
   if (current) {
     const a = answers.get(current);
-    if (a) a.el.querySelector('.label').textContent = 'Twin (interrupted)';
+    if (a) a.interrupted = true;
     window.twin.cancel(current);
   }
 }
@@ -144,7 +143,13 @@ function answer(id, decision) {
 }
 
 window.twin.onConfirm(({ id, summary, details, action, expires }) => {
-  const el = card('confirm', 'Needs you', summary);
+  const el = add('confirm');
+  el.setAttribute('role', 'alertdialog');
+  el.setAttribute('aria-label', summary);
+  const q = document.createElement('div');
+  q.className = 'question';
+  q.textContent = summary;
+  el.append(q);
   if (details.length) {
     const list = document.createElement('ul');
     list.className = 'details';
@@ -189,24 +194,6 @@ document.addEventListener('keydown', (e) => {
   for (const id of [...confirms.keys()]) answer(id, 'cancel');
 }, true);
 
-function today(items) {
-  const list = document.getElementById('today-list');
-  list.replaceChildren(...items.map(([when, what]) => {
-    const row = document.createElement('div');
-    row.className = 'today-item';
-    row.innerHTML = '<span class="what"></span><span class="when"></span>';
-    row.querySelector('.what').textContent = what;
-    row.querySelector('.when').textContent = when;
-    return row;
-  }));
-}
-
-// Hand-copied from the SIF1014 course-information form until slice 3 fills this from the store.
-today([
-  ['Tue 27 Oct', 'SIF1014 Test 1 · 10%'],
-  ['Tue 17 Nov', 'SIF1014 Tutorial 1 presentation'],
-]);
-
 // --- Push-to-talk microphone (step 2c) ------------------------------------------------------
 // The mic opens on key press (so the first word isn't clipped while a tap is told apart from a
 // hold) and is fully released on key up or tap. Audio goes to the main process as a 16 kHz WAV
@@ -237,7 +224,6 @@ async function micOpen() {
 async function micClose() {
   if (mic.opening) { try { await mic.opening; } catch {} }
   mic.live = false;
-  meter.classList.remove('on');
   meter.firstElementChild.style.width = '0';
   const { chunks, ctx } = mic;
   if (mic.proc) mic.proc.disconnect();
@@ -284,7 +270,7 @@ function toWav16k(chunks, rate) {
   return { bytes, seconds: pos / 16000 };
 }
 
-const heard = new Map(); // transcription id -> card element
+const heard = new Set(); // transcription ids still being transcribed
 const superseded = new Set(); // transcriptions dropped because a newer hold interrupted them
 
 window.twin.onMic(async (action) => {
@@ -295,7 +281,6 @@ window.twin.onMic(async (action) => {
       interrupt();
       await micOpen();
       mic.live = true;
-      meter.classList.add('on');
       setState('listening');
       requestAnimationFrame(drawMeter);
     } else if (action === 'discard') {
@@ -307,40 +292,37 @@ window.twin.onMic(async (action) => {
       const { bytes, seconds } = toWav16k(chunks, rate);
       if (seconds < 0.4) { setState('idle'); return; } // too short to be speech
       const id = newId();
-      heard.set(id, card('hint', 'Listening…', 'Transcribing'));
+      heard.add(id);
       setState('working');
       window.twin.sendAudio(id, bytes);
     }
   } catch (err) {
     await micClose();
-    card('answer error', 'Microphone', `Couldn't use the microphone (${err.name}).`);
+    showError(`Couldn't use the microphone (${err.name}).`);
     setState('idle');
   }
 });
 
 window.twin.onTranscript(({ id, ok, text, error }) => {
   if (superseded.delete(id)) return;
-  const placeholder = heard.get(id);
   heard.delete(id);
-  if (placeholder) placeholder.remove();
   if (!ok) {
-    card('answer error', 'Voice', `Couldn't transcribe that (${error || 'unknown error'}).`);
+    showError(`Couldn't transcribe that (${error || 'unknown error'}).`);
     setState('idle');
   } else if (!text) {
-    card('hint', 'Voice', "Didn't catch that. Hold the key and try again.");
+    showError("Didn't catch that.");
     setState('idle');
   } else {
-    ask(text, 'You said');
+    ask(text);
   }
 });
 
 window.twin.onVoiceStatus(({ ok, message }) => {
-  hint.querySelector('.body').textContent = ok
-    ? 'Type a question below, or hold numpad . (or Del) and speak.'
-    : message;
+  voiceStarting = false;
+  if (!ok) showError(message);
+  settleState();
 });
 
-const hint = card('hint', 'Connected to your twin', 'Type a question below. Voice is starting…');
 setState('idle');
 
 document.getElementById('hide').onclick = () => window.twin.hide();

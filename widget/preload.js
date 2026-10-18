@@ -3,8 +3,13 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('twin', {
   hide: () => ipcRenderer.send('widget:hide'),
+  layout: (size) => ipcRenderer.send('widget:layout', size),
+  drag: (on) => ipcRenderer.send('widget:drag', Boolean(on)),
   wantFocus: () => ipcRenderer.send('widget:want-focus'),
+  releaseFocus: () => ipcRenderer.send('widget:release-focus'),
   onFocusGranted: (cb) => ipcRenderer.on('focus-granted', () => cb()),
+  onFocusLost: (cb) => ipcRenderer.on('focus-lost', () => cb()),
+  onOnline: (cb) => ipcRenderer.on('twin:online', (_e, ok) => cb(ok)),
   ask: (id, text) => ipcRenderer.send('twin:ask', { id, text }),
   cancel: (id) => ipcRenderer.send('twin:cancel', { id }),
   onDelta: (cb) => ipcRenderer.on('twin:delta', (_e, m) => cb(m)),

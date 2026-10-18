@@ -6,7 +6,12 @@ Protocol: JSON lines. Commands on stdin, events on stdout.
   events:   {"event": "ready"} | {"event": "press"} | {"event": "hold"} | {"event": "release"}
             {"event": "tap"} | {"event": "transcript", "id", "ok", "text", "error", "ms"}
             {"event": "log", "message"}
-  commands: {"cmd": "transcribe", "id": "...", "path": "C:/...wav"} | {"cmd": "quit"}
+  commands: {"cmd": "transcribe", "id": "...", "path": "C:/...wav"} | {"cmd": "restore_focus"}
+            {"cmd": "quit"}
+
+restore_focus gives the keyboard back to the app that was in front before the widget took focus
+for typing. Electron can only blur its window, which hands focus to whatever Windows picks (often
+the desktop), so this process tracks the last foreground window that isn't the widget's.
 
 Push-to-talk follows wiki/projects/student-twin/voice-widget-spec.md v0.6, section 3: the numpad
 '.'/'Del' key (scan code 0x53, NOT extended) is held back on press; released before the threshold it
@@ -190,10 +195,89 @@ def run_hook():
         user32.DispatchMessageW(ctypes.byref(msg))
 
 
+# --- Foreground tracking, for handing the keyboard back after typing ---------------------------
+# The widget's main process owns its window. Not os.getppid(): a venv's python.exe is a launcher
+# that starts the real interpreter as its own child.
+WIDGET_PID = int(os.environ.get("STUDENT_TWIN_WIDGET_PID") or os.getppid())
+EVENT_SYSTEM_FOREGROUND = 0x0003
+WINEVENTPROC = ctypes.WINFUNCTYPE(None, wt.HANDLE, wt.DWORD, wt.HWND, wt.LONG, wt.LONG, wt.DWORD, wt.DWORD)
+user32.SetWinEventHook.argtypes = [wt.DWORD, wt.DWORD, wt.HMODULE, WINEVENTPROC, wt.DWORD, wt.DWORD, wt.DWORD]
+user32.SetWinEventHook.restype = wt.HANDLE
+user32.GetForegroundWindow.restype = wt.HWND
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.IsWindow.argtypes = [wt.HWND]
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+_last_other = None  # last foreground window that isn't the widget's
+TASKBAR_CLASSES = {"Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+
+
+def _note_foreground(hwnd):
+    global _last_other
+    if not hwnd:
+        return
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    cls = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, cls, 64)
+    # The taskbar takes the foreground for a moment when focus changes hands; it is never where
+    # the keyboard should go back to. Nor is an invisible window, or the widget itself.
+    if pid.value != WIDGET_PID and user32.IsWindowVisible(hwnd) and cls.value not in TASKBAR_CLASSES:
+        _last_other = hwnd
+
+
+def run_focus_tracker():
+    @WINEVENTPROC
+    def on_foreground(_hook, _event, hwnd, _obj, _child, _thread, _time):
+        _note_foreground(hwnd)
+
+    _note_foreground(user32.GetForegroundWindow())
+    if not user32.SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, on_foreground, 0, 0, 0):
+        emit(event="log", message="foreground tracking failed")
+        return
+    msg = wt.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        user32.DispatchMessageW(ctypes.byref(msg))
+
+
+def restore_focus():
+    hwnd = _last_other
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+    # If Bhanu has already moved on to another app, leave him there.
+    fg = user32.GetForegroundWindow()
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+    cls = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(fg, cls, 64)
+    if fg and pid.value != WIDGET_PID and cls.value not in TASKBAR_CLASSES:
+        return
+    # Only the process that received the last input may change the foreground window; an empty
+    # mouse input sent from here counts as that (the workaround desktop.py's _focus uses).
+    empty = INPUT(type=0)  # INPUT_MOUSE
+    user32.SendInput(1, ctypes.byref(empty), ctypes.sizeof(INPUT))
+    user32.SetForegroundWindow(hwnd)
+
+
 # --- Transcription (Hermes's own faster-whisper path) -----------------------------------------
 def transcribe(path):
     from tools.transcription_tools import transcribe_audio  # imported lazily: heavy
     return transcribe_audio(path, source="student-twin-widget")
+
+
+_jobs = queue.Queue()
+
+
+def run_transcriber():
+    while True:
+        cmd = _jobs.get()
+        t0 = time.perf_counter()
+        try:
+            result = transcribe(cmd["path"])
+        except Exception as exc:
+            result = {"success": False, "transcript": "", "error": f"{type(exc).__name__}: {exc}"}
+        emit(event="transcript", id=cmd.get("id"), ok=bool(result.get("success")),
+             text=(result.get("transcript") or "").strip(), error=result.get("error"),
+             ms=round((time.perf_counter() - t0) * 1000))
 
 
 def run_commands():
@@ -205,14 +289,9 @@ def run_commands():
         if cmd.get("cmd") == "quit":
             os._exit(0)
         if cmd.get("cmd") == "transcribe":
-            t0 = time.perf_counter()
-            try:
-                result = transcribe(cmd["path"])
-            except Exception as exc:
-                result = {"success": False, "transcript": "", "error": f"{type(exc).__name__}: {exc}"}
-            emit(event="transcript", id=cmd.get("id"), ok=bool(result.get("success")),
-                 text=(result.get("transcript") or "").strip(), error=result.get("error"),
-                 ms=round((time.perf_counter() - t0) * 1000))
+            _jobs.put(cmd)  # transcribed in order on its own thread, so focus commands never wait
+        elif cmd.get("cmd") == "restore_focus":
+            restore_focus()
     os._exit(0)  # widget closed our stdin
 
 
@@ -243,8 +322,10 @@ def main():
     threading.Thread(target=_writer, daemon=True).start()
     if "--no-hook" not in sys.argv:
         threading.Thread(target=run_hook, daemon=True).start()
+    threading.Thread(target=run_focus_tracker, daemon=True).start()
     emit(event="ready")
     warm_up()
+    threading.Thread(target=run_transcriber, daemon=True).start()
     run_commands()
 
 

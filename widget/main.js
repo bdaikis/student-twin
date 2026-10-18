@@ -1,5 +1,7 @@
-// Student Twin widget — main process (slice 2: 2a window shell, 2b connection to Hermes).
-// Behaviour follows wiki/projects/student-twin/voice-widget-spec.md v0.6.
+// Student Twin widget — main process.
+// Behaviour follows wiki/projects/student-twin/voice-widget-spec.md; the window and its look follow
+// the Ghost Overlay UI Redesign (2026-10-18): one window that fits its content, anchored at the
+// visible shape's top-right corner.
 const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, session } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -9,44 +11,75 @@ const readline = require('readline');
 
 // Hermes's OpenAI-compatible api_server, loopback only. Its key never leaves this process.
 const HERMES_URL = 'http://127.0.0.1:8642/v1/chat/completions';
+const HERMES_HEALTH = 'http://127.0.0.1:8642/health';
 const HERMES_ENV = path.join(process.env.HERMES_HOME || path.join(process.env.LOCALAPPDATA, 'hermes'), '.env');
 let sessionId = null; // X-Hermes-Session-Id: one conversation per widget run
 const inflight = new Map(); // request id -> AbortController
 
-const WIDTH = 360;
-const HEIGHT = 750;
-const TOP_OFFSET = 100;
-const SLIDE_MS = 160;
+// Geometry, in DIP. The renderer reports the visible shape's size; the window adds a transparent
+// margin on every side for the CSS shadow and is placed so the shape's top-right corner stays put.
+const MARGIN = 10;
+const RIGHT_INSET = 20; // visible right edge, in from the work area's right edge
+const TOP_OFFSET = 100; // visible top edge, down from the work area's top
+const REST = 28; // the resting dot
+const REVEAL_ZONE_W = 360; // top-edge reveal stretch, fixed whatever the widget's size
 const REVEAL_POLL_MS = 100;
 const REVEAL_DWELL_MS = 400;
+const HIDE_FADE_MS = 200; // renderer fade before the window moves offscreen
 const CAPTION_BUTTONS_DIP = 3 * 46; // minimise, maximise, close of a maximised window
 
 let win = null;
 let tray = null;
 let hidden = false;
-let homeX = null; // where the widget sits when shown (follows drags)
+let anchor = null; // { right, top }: the visible shape's top-right corner when shown
+let shape = { w: REST, h: REST }; // last size the renderer asked for
 let dwellStart = null;
+let hideTimer = null; // "Hide for 1 hour"
+let placing = false; // true while this process moves the window, so 'moved' isn't read as a drag
 
-function primaryRightEdge() {
+function defaultAnchor() {
   const { workArea } = screen.getPrimaryDisplay();
-  return { x: workArea.x + workArea.width - WIDTH, y: workArea.y + TOP_OFFSET };
+  return { right: workArea.x + workArea.width - RIGHT_INSET, top: workArea.y + TOP_OFFSET };
+}
+
+// Window bounds for a shape of size w x h at the anchor, kept inside the anchor's work area. A
+// shape that would run past the bottom grows upward instead.
+function boundsFor(w, h, at = anchor) {
+  const width = Math.round(w) + 2 * MARGIN;
+  const height = Math.round(h) + 2 * MARGIN;
+  const { workArea } = screen.getDisplayNearestPoint({ x: Math.round(at.right - 1), y: Math.round(at.top) });
+  let x = Math.round(at.right + MARGIN - width);
+  let y = Math.round(at.top - MARGIN);
+  x = Math.max(workArea.x - MARGIN, Math.min(x, workArea.x + workArea.width + MARGIN - width));
+  y = Math.max(workArea.y - MARGIN, Math.min(y, workArea.y + workArea.height + MARGIN - height));
+  return { x, y, width, height };
+}
+
+function place(bounds) {
+  placing = true;
+  win.setBounds(bounds); // one atomic call: separate move and resize calls flicker
+  // Windows enforces a minimum window size (about 51 x 50 DIP at 150%) and grows a smaller window
+  // to the right; move it left by the excess so the shape's right edge stays on the anchor.
+  const got = win.getBounds();
+  if (got.width > bounds.width + 1) win.setBounds({ ...got, x: bounds.x - (got.width - bounds.width) });
+  placing = false;
 }
 
 function createWindow() {
-  const start = primaryRightEdge();
+  anchor = defaultAnchor();
   win = new BrowserWindow({
-    width: WIDTH,
-    height: HEIGHT,
-    x: start.x,
-    y: start.y,
+    ...boundsFor(REST, REST),
     frame: false,
     transparent: true,
+    backgroundColor: '#00000000',
+    hasShadow: false, // the shadow is CSS, inside the margin
+    thickFrame: false, // stops DWM flashing the whole window on every resize
     resizable: false,
     maximizable: false,
     fullscreenable: false,
     skipTaskbar: true,
-    // Non-activating: clicks on cards and buttons work without taking focus from the app
-    // Bhanu is using. The input box asks for focus explicitly (widget:want-focus).
+    // Non-activating: clicks on the pill and cards work without taking focus from the app
+    // Bhanu is using. Typing asks for focus explicitly (widget:want-focus).
     focusable: false,
     show: false,
     webPreferences: {
@@ -54,21 +87,73 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Moved offscreen to hide, the page is marked hidden and stops getting animation frames,
+      // and Chromium doesn't always notice when it comes back; the layout depends on them.
+      backgroundThrottling: false,
     },
   });
   win.setAlwaysOnTop(true, 'screen-saver');
-  // Keep the widget out of screenshots and screen recordings (incl. the agent's own, later).
+  // Keep the widget out of screenshots and screen recordings (incl. the agent's own).
   win.setContentProtection(true);
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   win.once('ready-to-show', () => {
-    win.showInactive(); // never steal focus from the app Bhanu is using
-    homeX = win.getBounds().x;
+    place(boundsFor(REST, REST)); // applies the minimum-size correction from the start
+    win.showInactive(); // never steal focus
   });
+  // A drag by the grip moves the anchor: the new spot is where it lives from now on.
   win.on('moved', () => {
-    if (!hidden) homeX = win.getBounds().x;
+    if (hidden || placing) return;
+    const b = win.getBounds();
+    anchor = { right: b.x + b.width - MARGIN, top: b.y + MARGIN };
   });
-  // Give focus back the moment Bhanu leaves the input box for another app.
-  win.on('blur', () => win.setFocusable(false));
+  // Give focus back the moment Bhanu leaves the typing box for another app.
+  win.on('blur', () => { win.setFocusable(false); toRenderer('focus-lost'); });
+  screen.on('display-metrics-changed', reanchor);
+  screen.on('display-removed', reanchor);
+}
+
+// A display change can leave the anchor off every screen; pull it back to the nearest work area.
+function reanchor() {
+  if (!win) return;
+  const { workArea } = screen.getDisplayNearestPoint({ x: Math.round(anchor.right), y: Math.round(anchor.top) });
+  anchor = {
+    right: Math.max(workArea.x + REST, Math.min(anchor.right, workArea.x + workArea.width)),
+    top: Math.max(workArea.y, Math.min(anchor.top, workArea.y + workArea.height - REST)),
+  };
+  if (!hidden) place(boundsFor(shape.w, shape.h));
+}
+
+function applyLayout({ w, h }) {
+  if (!win || !(w > 0 && h > 0)) return;
+  shape = { w, h };
+  if (hidden) return;
+  const next = boundsFor(w, h);
+  const cur = win.getBounds();
+  // Changes of 2 px or less aren't worth a native resize.
+  if (Math.abs(next.width - cur.width) <= 2 && Math.abs(next.height - cur.height) <= 2 &&
+      Math.abs(next.x - cur.x) <= 2 && Math.abs(next.y - cur.y) <= 2) return;
+  place(next);
+}
+
+// Dragging by the grip: follow the cursor from where the drag began. The page captures the
+// pointer and says when it ends; the new spot becomes the anchor.
+let dragging = null;
+function drag(on) {
+  if (!win || hidden) return;
+  if (on && !dragging) {
+    const start = screen.getCursorScreenPoint();
+    const b = win.getBounds();
+    dragging = setInterval(() => {
+      const p = screen.getCursorScreenPoint();
+      place({ ...win.getBounds(), x: b.x + p.x - start.x, y: b.y + p.y - start.y });
+    }, 16);
+  } else if (!on && dragging) {
+    clearInterval(dragging);
+    dragging = null;
+    const b = win.getBounds();
+    anchor = { right: b.x + b.width - MARGIN, top: b.y + MARGIN };
+    place(boundsFor(shape.w, shape.h)); // pulls it back inside the work area if dropped past an edge
+  }
 }
 
 function wantFocus() {
@@ -78,43 +163,56 @@ function wantFocus() {
   win.webContents.send('focus-granted');
 }
 
-function animateX(fromX, toX, done) {
-  const y = win.getBounds().y;
-  const t0 = Date.now();
-  const step = () => {
-    const t = Math.min(1, (Date.now() - t0) / SLIDE_MS);
-    const eased = 1 - Math.pow(1 - t, 3);
-    win.setBounds({ x: Math.round(fromX + (toX - fromX) * eased), y, width: WIDTH, height: HEIGHT });
-    if (t < 1) setTimeout(step, 10);
-    else if (done) done();
-  };
-  step();
+// After a typed request is sent, hand the keyboard back to the app Bhanu was using. blur() alone
+// lets Windows pick the next window (often the desktop), so the voice helper, which tracks the
+// last foreground window, restores it.
+function releaseFocus() {
+  if (!win) return;
+  win.setFocusable(false);
+  if (helper) helper.stdin.write(`${JSON.stringify({ cmd: 'restore_focus' })}\n`);
+  else win.blur();
 }
 
+// Hide: the renderer fades the shape out, then the window moves offscreen in one call and stops
+// taking the mouse. The native window is never hidden: hide/show cycles have been tied to clicks
+// being swallowed on non-activating windows and to black boxes in screen captures.
 function hideWidget() {
   if (hidden || !win) return;
   hidden = true;
-  const display = screen.getDisplayMatching(win.getBounds());
-  const offscreen = display.bounds.x + display.bounds.width;
-  animateX(win.getBounds().x, offscreen, () => win.hide());
-  win.webContents.send('visibility', false);
+  dwellStart = null;
+  toRenderer('visibility', false);
+  setTimeout(() => {
+    if (!hidden) return;
+    const b = win.getBounds();
+    const display = screen.getDisplayMatching(b);
+    win.setIgnoreMouseEvents(true);
+    place({ ...b, x: display.bounds.x + display.bounds.width + 50 });
+    updateTray();
+  }, HIDE_FADE_MS + 20);
 }
 
 function showWidget() {
-  if (!hidden || !win) return;
+  if (!win) return;
+  if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+  if (!hidden) return;
   hidden = false;
-  const display = screen.getDisplayMatching({ x: homeX, y: win.getBounds().y, width: WIDTH, height: HEIGHT });
-  const offscreen = display.bounds.x + display.bounds.width;
-  win.setBounds({ x: offscreen, y: win.getBounds().y, width: WIDTH, height: HEIGHT });
-  win.showInactive();
+  place(boundsFor(shape.w, shape.h));
+  win.setIgnoreMouseEvents(false);
   win.setAlwaysOnTop(true, 'screen-saver');
-  animateX(offscreen, homeX, null);
-  win.webContents.send('visibility', true);
+  win.setContentProtection(true); // re-assert on every show
+  if (!win.isVisible()) win.showInactive();
+  toRenderer('visibility', true);
+  updateTray();
 }
 
-// Top-edge reveal: a fixed stretch of the primary display's top edge, above the widget's
-// default position (not wherever it was dragged), minus the caption-button corner, after a
-// short dwell. Polled, so no invisible strip window can swallow clicks on tabs or title bars.
+function hideForAnHour() {
+  hideWidget();
+  hideTimer = setTimeout(() => { hideTimer = null; showWidget(); }, 60 * 60 * 1000);
+}
+
+// Top-edge reveal: a fixed stretch of the primary display's top edge above the widget's default
+// position (not wherever it was dragged), minus the caption-button corner, after a short dwell.
+// Polled, so no invisible strip window can swallow clicks on tabs or title bars.
 function isTopEdgeOfDesktop(display) {
   // With monitors stacked vertically, only the top display's top edge counts.
   return !screen.getAllDisplays().some((d) =>
@@ -125,17 +223,25 @@ function isTopEdgeOfDesktop(display) {
 }
 
 function pollReveal() {
-  if (!hidden || !win || homeX === null) { dwellStart = null; return; }
+  if (!hidden || !win) { dwellStart = null; return; }
   const p = screen.getCursorScreenPoint();
   const display = screen.getPrimaryDisplay();
   const right = display.bounds.x + display.bounds.width;
-  const zoneLeft = right - WIDTH;
+  const zoneLeft = right - REVEAL_ZONE_W;
   const zoneRight = right - CAPTION_BUTTONS_DIP;
   const inZone = p.y <= display.bounds.y + 1 && p.x >= zoneLeft && p.x < zoneRight && isTopEdgeOfDesktop(display);
   // TODO(2e): suppress while a full-screen app is in front (SHQueryUserNotificationState).
   if (!inZone) { dwellStart = null; return; }
   if (dwellStart === null) dwellStart = Date.now();
   if (Date.now() - dwellStart >= REVEAL_DWELL_MS) { dwellStart = null; showWidget(); }
+}
+
+// Whether Hermes is up, for the resting pill's offline mark. /health needs no key.
+let online = null;
+async function pollOnline() {
+  let ok = false;
+  try { ok = (await fetch(HERMES_HEALTH, { signal: AbortSignal.timeout(3000) })).ok; } catch {}
+  if (ok !== online) { online = ok; toRenderer('twin:online', ok); }
 }
 
 function hermesKey() {
@@ -163,7 +269,7 @@ const WIDGET_RULES = [
   "Prefer the desktop tools over screen control. Use the weather tool for weather, rain and air quality, and web search for other facts. For anything posted in a course use course_materials and open_course_item; for attendance use attendance; for his classes on a day use timetable_day. When he says he is in class (\"here\", \"check me in\"), call mark_attendance. To create a text file use write_text_file.",
   'To see or act inside an open window (a page in Chrome, a list in File Explorer, a button in an app), use ui_read first, then ui_click or ui_type by the element names it returns. Use web_extract only for pages that are not open on screen.',
   'When a window or app name matches nothing, check list_windows and ask whether he meant the closest-sounding one, naming it.',
-  "Irreversible tools such as delete_files show him a confirm card themselves and wait for his click: call them directly, without asking for confirmation in chat, and never retry one he cancelled. Never claim something was deleted unless the tool result says so.",
+  "Irreversible tools such as delete_files show him a confirm card themselves and wait for his click: call them directly, without asking for confirmation in chat, and never retry one he cancelled. When he cancels the card or it times out, reply with only ${DONE_MARK}: the card already shows the outcome. Never claim something was deleted unless the tool result says so.",
 ].join(' ');
 
 // Stream one answer from Hermes, forwarding text deltas to the renderer as they arrive.
@@ -232,8 +338,10 @@ function hermesPython() {
 }
 
 function toRenderer(channel, payload) {
+  if (channel === 'voice:status') lastVoiceStatus = payload;
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
+let lastVoiceStatus = null;
 
 function startHelper() {
   let python;
@@ -242,7 +350,8 @@ function startHelper() {
     return;
   }
   helper = spawn(python, [path.join(__dirname, 'helper', 'voice_helper.py')], {
-    env: { ...process.env, HERMES_HOME, PYTHONPATH: path.join(HERMES_HOME, 'hermes-agent'), PYTHONIOENCODING: 'utf-8' },
+    env: { ...process.env, HERMES_HOME, PYTHONPATH: path.join(HERMES_HOME, 'hermes-agent'), PYTHONIOENCODING: 'utf-8',
+      STUDENT_TWIN_WIDGET_PID: String(process.pid) },
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'ignore'],
   });
@@ -336,26 +445,34 @@ function answerConfirm(id, decision) {
 }
 
 function trayIcon() {
-  // 16x16 indigo dot, generated so the repo needs no binary asset for step 2a.
+  // 16x16 white dot with a dark outline, legible on light and dark taskbars. Generated, so the
+  // repo needs no binary asset.
   const size = 16;
   const buf = Buffer.alloc(size * size * 4);
   for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
     const i = (y * size + x) * 4;
-    const inside = (x - 7.5) ** 2 + (y - 7.5) ** 2 <= 36;
-    buf[i] = 0xe5; buf[i + 1] = 0x46; buf[i + 2] = 0x4f; buf[i + 3] = inside ? 255 : 0; // BGRA
+    const r = Math.hypot(x - 7.5, y - 7.5);
+    const [v, a] = r <= 4.5 ? [255, 255] : r <= 6 ? [24, 255] : [0, 0];
+    buf[i] = v; buf[i + 1] = v; buf[i + 2] = v; buf[i + 3] = a; // BGRA
   }
   return nativeImage.createFromBitmap(buf, { width: size, height: size });
+}
+
+// The tray is the one place the product name appears.
+function updateTray() {
+  if (!tray) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    hidden ? { label: 'Show', click: showWidget } : { label: 'Hide', click: hideWidget },
+    { label: 'Hide for 1 hour', click: hideForAnHour, enabled: !hideTimer },
+    { type: 'separator' },
+    { label: 'Quit Student Twin', click: () => app.quit() },
+  ]));
 }
 
 function createTray() {
   tray = new Tray(trayIcon());
   tray.setToolTip('Student Twin');
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Show', click: showWidget },
-    { label: 'Hide', click: hideWidget },
-    { type: 'separator' },
-    { label: 'Quit Student Twin', click: () => app.quit() },
-  ]));
+  updateTray();
   tray.on('click', () => (hidden ? showWidget() : hideWidget()));
 }
 
@@ -366,10 +483,20 @@ app.whenReady().then(() => {
   session.defaultSession.setPermissionCheckHandler((_wc, permission) => permission === 'media');
   createWindow();
   win.webContents.once('did-finish-load', startHelper);
+  // On every load (including a reload) tell the page what it may have missed.
+  win.webContents.on('did-finish-load', () => {
+    if (lastVoiceStatus) toRenderer('voice:status', lastVoiceStatus);
+    if (online !== null) toRenderer('twin:online', online);
+  });
   createTray();
   setInterval(pollReveal, REVEAL_POLL_MS);
+  pollOnline();
+  setInterval(pollOnline, 10000);
   ipcMain.on('widget:hide', hideWidget);
   ipcMain.on('widget:want-focus', wantFocus);
+  ipcMain.on('widget:release-focus', releaseFocus);
+  ipcMain.on('widget:layout', (_e, size) => applyLayout(size));
+  ipcMain.on('widget:drag', (_e, on) => drag(on));
   ipcMain.on('twin:ask', (e, { id, text }) => ask(e.sender, id, String(text).slice(0, 8000)));
   ipcMain.on('twin:cancel', (_e, { id }) => inflight.get(id)?.abort());
   ipcMain.on('mic:audio', (_e, { id, wav }) => transcribeWav(id, wav));

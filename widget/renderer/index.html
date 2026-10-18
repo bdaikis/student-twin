@@ -7,20 +7,33 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <!-- No title= attributes anywhere: native tooltips are separate OS windows that can escape
-       content protection and show up in the twin's own screenshots. -->
-  <div class="panel">
-    <header class="header">
-      <span id="dot" class="dot idle starting" role="status" aria-label="Idle"></span>
-      <button id="hide" class="icon-btn" aria-label="Hide">&#x2014;</button>
-    </header>
-    <div id="meter" class="meter" aria-hidden="true"><span></span></div>
-
-    <main id="conversation" class="conversation" aria-live="polite"></main>
-
-    <footer class="input-bar">
-      <textarea id="input" rows="1" placeholder="Type a request" aria-label="Type a request"></textarea>
-    </footer>
+  <!-- One shape at a time: the pill (rest, listening, working, tick) or a card (answer, error,
+       confirm, typing). The window is sized to it. The pill's controls sit left of its mark, so
+       widening on hover never slides a control under a cursor resting on the dot. No title=
+       attributes anywhere: native tooltips are separate OS windows that can escape content
+       protection. -->
+  <div id="shell" class="shell" data-view="rest" data-voice="starting" data-online="1">
+    <div id="inner" class="inner">
+      <div class="pill" id="pill" role="status" aria-label="Idle">
+        <button class="chev" id="hide" aria-label="Hide">&#x203A;</button>
+        <span class="grip" id="grip" aria-hidden="true"></span>
+        <span class="glyph" aria-hidden="true">
+          <span class="dot"></span>
+          <span class="bang">!</span>
+          <span class="tick">&#x2713;</span>
+          <span class="bars" id="bars"><i></i><i></i><i></i><i></i><i></i></span>
+          <span class="dots"><i></i><i></i><i></i></span>
+        </span>
+        <span class="line" id="line"></span>
+      </div>
+      <div class="card" id="card">
+        <button class="close" id="close" aria-label="Close">&#xD7;</button>
+        <div class="echo" id="echo"></div>
+        <div class="body" id="body" aria-live="polite"></div>
+        <div class="confirm" id="confirm" role="alertdialog"></div>
+        <textarea id="input" rows="1" placeholder="Type a request" aria-label="Type a request"></textarea>
+      </div>
+    </div>
   </div>
   <script src="renderer.js"></script>
 </body>

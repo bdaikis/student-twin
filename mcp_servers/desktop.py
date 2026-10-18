@@ -5,8 +5,10 @@ never for Telegram (platform_toolsets.telegram includes `no_mcp`).
 
 Most tools here are reversible: opening things, media controls, moving, focusing and closing
 windows (closing asks the program, as its X button does, so it can still offer to save), listing
-files. Irreversible ones (step 2d-ii: delete_files) act only after Bhanu clicks Confirm on the
-widget's confirm card; see confirm.py.
+files, creating new text files (never overwriting), reading attendance, and reading or clicking a
+window's labelled elements through UI Automation (ui_read, ui_click, ui_type), which refuse
+messaging windows and elements that look irreversible. Irreversible tools (step 2d-ii:
+delete_files) act only after Bhanu clicks Confirm on the widget's confirm card; see confirm.py.
 
 Course contents come from the portal's Moodle API through moodle.py (read-only allowlist).
 Per-user settings (course pages, browser profiles, default music, home city) come from
@@ -29,7 +31,9 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from mcp.server.mcpserver import MCPServer
 
-CONFIG_PATH = Path(os.environ.get("STUDENT_TWIN_HOME") or Path(os.environ["LOCALAPPDATA"]) / "student-twin") / "config.json"
+from common import CONFIG_PATH, config as _config, course_contents as _course_contents
+from common import match_course as _match_course, norm as _norm
+
 
 server = MCPServer(
     "desktop",
@@ -51,17 +55,6 @@ user32.GetForegroundWindow.restype = wt.HWND
 user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
 
 BROWSERS = ("chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", "opera.exe", "vivaldi.exe")
-
-
-def _config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-def _norm(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
 # --- Opening things ---------------------------------------------------------------------------
@@ -136,21 +129,6 @@ def _loading_title(title: str, url: str) -> bool:
             or page.startswith(("http:", "https:")) or page == host or (bool(host) and page.startswith(host + "/")))
 
 
-def _match_course(course: str) -> tuple[str, dict] | str:
-    """(code, info) for a course code ("SIF1014") or part of its name ("thermal physics"), or an
-    error sentence listing the courses."""
-    courses = _config().get("courses", {})
-    q = _norm(course).replace(" ", "")
-    for code, info in courses.items():
-        if q and (q == code.lower() or q in code.lower()):
-            return code, info
-    hits = [code for code, info in courses.items() if _norm(course) and _norm(course) in _norm(info["name"])]
-    if len(hits) == 1:
-        return hits[0], courses[hits[0]]
-    known = ", ".join(f"{c} ({i['name']})" for c, i in courses.items())
-    return f"No single course matches {course!r}. Courses: {known}."
-
-
 @server.tool()
 def open_url(url: str) -> str:
     """Open a web page in the browser and bring it to the front. Only http and https addresses are
@@ -181,53 +159,6 @@ def open_course(course: str) -> str:
         return match
     code, info = match
     return f"{code} {info['name']}: " + _open_web(info["url"])
-
-
-def _moodle():
-    from moodle import Moodle  # imported lazily: only the course tools need it
-    portal = _config().get("portal", {})
-    global _moodle_client
-    if _moodle_client is None or _moodle_client.site != portal.get("url", "").rstrip("/"):
-        _moodle_client = Moodle(portal["url"], portal.get("token_credential", "student-twin/spectrum-token"))
-    return _moodle_client
-
-
-_moodle_client = None
-
-
-def _course_contents(course: str):
-    """(code, info, sections) or an error sentence."""
-    match = _match_course(course)
-    if isinstance(match, str):
-        return match
-    code, info = match
-    course_id = parse_qs(urlparse(info["url"]).query).get("id", [None])[0]
-    if not course_id or not _config().get("portal", {}).get("url"):
-        return f"{code} has no portal course id or the portal isn't configured."
-    from moodle import MoodleError
-    try:
-        return code, info, _moodle().course_contents(int(course_id))
-    except MoodleError as exc:
-        return f"Couldn't read {code} from the portal: {exc}."
-
-
-@server.tool()
-def course_materials(course: str) -> str:
-    """List what is posted in a course on the university portal: lecture notes, slides, files,
-    folders, links, assignments and quizzes, section by section. Read-only. Use it to answer what is
-    in a course or to find the exact name of an item before open_course_item."""
-    got = _course_contents(course)
-    if isinstance(got, str):
-        return got
-    code, info, sections = got
-    lines = [f"{code} {info['name']}:"]
-    for sec in sections:
-        lines.append(f"## {sec['name']}")
-        for m in sec["modules"]:
-            files = f" (files: {', '.join(m['files'][:5])}{', …' if len(m['files']) > 5 else ''})" if m["files"] else ""
-            lines.append(f"- [{m['type']}] {m['name']}{files}")
-    text = "\n".join(lines)
-    return text if len(text) <= 6000 else text[:6000] + "\n… (list cut short)"
 
 
 @server.tool()
@@ -820,6 +751,208 @@ async def delete_files(folder: str, pattern: str, recursive: bool = False,
         return f"Moved {len(files)} file(s) from {path} to the Recycle Bin."
     return (f"Moved {len(files) - len(left)} of {len(files)} file(s) to the Recycle Bin; "
             f"{len(left)} could not be moved (shell error {code:#x}), e.g. {left[0].name if left else ''}.")
+
+
+_TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".py", ".html", ".css", ".js", ".tex", ".log"}
+
+
+@server.tool()
+def write_text_file(folder: str, name: str, text: str) -> str:
+    """Create a new text file and write `text` into it. `folder` as in list_files (Downloads,
+    Desktop, Documents, ... or a path inside Bhanu's user folder); `name` is a plain file name such
+    as "hello.txt" (.txt, .md, .csv, .json, .py, .html, .css, .js, .tex or .log). Never overwrites:
+    if the file exists, nothing is written."""
+    path = _resolve_folder(folder)
+    if isinstance(path, str):
+        return path
+    name = name.strip().strip('"')
+    if not name or Path(name).name != name or name.startswith("."):
+        return f"Refused: {name!r} must be a plain file name, without folders."
+    if Path(name).suffix.lower() not in _TEXT_EXTENSIONS:
+        return f"Refused: only text files ({', '.join(sorted(_TEXT_EXTENSIONS))})."
+    if len(text.encode("utf-8")) > 1_000_000:
+        return "Refused: the text is over 1 MB."
+    target = path / name
+    try:
+        with open(target, "x", encoding="utf-8", newline="") as f:  # "x" fails if the file exists
+            f.write(text)
+    except FileExistsError:
+        return f"{target} already exists; nothing was written. Choose another name."
+    except OSError as exc:
+        return f"Couldn't write {target}: {exc.strerror or exc}."
+    return f"Created {target} ({_size(target.stat().st_size)})."
+
+
+# --- Accessibility layer (step 2d-iii, layer 2): read and act on a window's labelled elements ---
+# Windows UI Automation exposes most windows as a tree of named elements (buttons, links, list
+# items, text boxes), as screen readers see them. Reading it needs no screenshot and one model step.
+# Like screen control, this layer only promises to stay away from irreversible actions, so it
+# refuses messaging windows and elements whose names suggest one; deleting goes through
+# delete_files and its confirm card.
+
+_MESSAGING = re.compile(r"(?i)whatsapp|gmail|outlook|telegram|messenger|discord|slack|signal|teams|\bmail\b|inbox")
+_IRREVERSIBLE = re.compile(r"(?i)\b(delete|remove|erase|uninstall|submit|send|pay|purchase|buy|checkout|"
+                           r"place order|transfer|unenrol|unenroll|format|reset|discard|empty)\b")
+_UI_KINDS = {"ButtonControl": "button", "HyperlinkControl": "link", "MenuItemControl": "menu item",
+             "ListItemControl": "list item", "TabItemControl": "tab", "TreeItemControl": "tree item",
+             "EditControl": "text box", "CheckBoxControl": "checkbox", "RadioButtonControl": "radio button",
+             "ComboBoxControl": "dropdown", "TextControl": "text", "DocumentControl": "document",
+             "DataItemControl": "row", "SplitButtonControl": "button"}
+_ACTIONABLE = {"button", "link", "menu item", "list item", "tab", "tree item", "checkbox", "radio button", "row"}
+
+
+def _ui_window(name: str):
+    """(window dict, error) for a window the accessibility tools may use."""
+    hits = _find_windows(name)
+    if not hits:
+        return None, f"No open window matches {name!r}. Use list_windows to see what's open."
+    win = hits[0]
+    if _MESSAGING.search(win["title"]) or _MESSAGING.search(win["process"]):
+        return None, f"Refused: {win['title']!r} is a messaging window; the twin doesn't read or act in those."
+    # A minimized window exposes only its title bar; restore it so its contents can be read.
+    win["restored"] = bool(user32.IsIconic(win["hwnd"]))
+    if win["restored"]:
+        user32.ShowWindow(win["hwnd"], 9)  # SW_RESTORE
+        time.sleep(0.6)
+    return win, None
+
+
+def _ui_root(win):
+    """The part of the window to read: for a browser, the page itself (its document element),
+    leaving out the tab strip, address bar and extension buttons; otherwise the whole window."""
+    import uiautomation as auto
+    root = auto.ControlFromHandle(win["hwnd"])
+    if win["process"].lower() in BROWSERS:
+        docs = [c for c, _ in auto.WalkControl(root, maxDepth=12) if c.ControlTypeName == "DocumentControl"]
+        named = [c for c in docs if c.Name and c.Name in win["title"]]
+        if named or docs:
+            return (named or docs)[0]
+    return root
+
+
+def _ui_elements(win, limit: int = 250, depth: int = 30) -> list[tuple]:
+    """(kind, name, control) for the window's named elements in reading order."""
+    import uiautomation as auto
+    root = _ui_root(win)
+    out, seen = [], set()
+    for control, _ in auto.WalkControl(root, maxDepth=depth):
+        kind = _UI_KINDS.get(control.ControlTypeName)
+        if not kind:
+            continue
+        name = " ".join((control.Name or "").split())
+        if not name or len(name) > 300 or (kind, name) in seen and kind == "text":
+            continue
+        seen.add((kind, name))
+        out.append((kind, name, control))
+        if len(out) >= limit:
+            break
+    return out
+
+
+@server.tool()
+def ui_read(window: str, contains: str = "") -> str:
+    """Read a window's labelled elements as text: buttons, links, tabs, list items, text boxes and
+    visible text, in order. Use it to see what's on screen without a screenshot, e.g. the links on a
+    course page in Chrome or the prices on a shop page, then ui_click or ui_type by name.
+    `contains` keeps only elements whose name includes it. Not for messaging windows."""
+    import uiautomation as auto
+    win, err = _ui_window(window)
+    if err:
+        return err
+    with auto.UIAutomationInitializerInThread():
+        elements = _ui_elements(win)
+        q = _norm(contains)
+        lines = [f"- {kind}: {name}" for kind, name, _ in elements if not q or q in _norm(name)]
+    if not lines:
+        return (f"{win['title']!r} shows no labelled elements" + (f" containing {contains!r}" if q else "")
+                + ". It may not support accessibility; screen control would be needed.")
+    head = f"{win['title']!r}, {len(lines)} element(s)" + (" (reading stopped at 250 elements)" if len(elements) >= 250 else "")
+    if win.get("restored"):
+        head += " (it was minimized; restored it to read it)"
+    return head + ":\n" + "\n".join(lines[:250])
+
+
+def _ui_target(window: str, element: str, kinds: set[str]):
+    """(window, control, kind, name, error) for the single best match of `element` in `window`."""
+    win, err = _ui_window(window)
+    if err:
+        return None, None, None, None, err
+    q = _norm(element)
+    elements = [e for e in _ui_elements(win) if e[0] in kinds]
+    # When one name labels several elements (a menu entry and its link), act on the most direct one.
+    rank = {"link": 0, "button": 1, "tab": 2, "menu item": 3, "checkbox": 4, "radio button": 5}
+    exact = sorted((e for e in elements if _norm(e[1]) == q), key=lambda e: rank.get(e[0], 9))
+    partial = [e for e in elements if q and q in _norm(e[1])]
+    hits = exact or partial
+    if not hits:
+        return win, None, None, None, f"No {'/'.join(sorted(kinds))} named like {element!r} in {win['title']!r}. Try ui_read."
+    if len(hits) > 1 and not exact and len({_norm(n) for _, n, _ in hits}) > 1:
+        names = "; ".join(f"{k} '{n}'" for k, n, _ in hits[:8])
+        return win, None, None, None, f"Several elements match {element!r}: {names}. Say which."
+    kind, name, control = hits[0]
+    if _IRREVERSIBLE.search(name):
+        return win, None, None, None, (f"Refused: {kind} '{name}' looks irreversible. Deleting goes through "
+                                       "delete_files; other irreversible actions are for Bhanu to do himself.")
+    return win, control, kind, name, None
+
+
+@server.tool()
+def ui_click(window: str, element: str) -> str:
+    """Click a button, link, tab, list item, menu item or checkbox in a window by its name, as read
+    by ui_read (e.g. window "SPeCTRUM", element "Lecture 1"). Refuses elements that look
+    irreversible (delete, submit, send, pay...) and messaging windows."""
+    import uiautomation as auto
+    with auto.UIAutomationInitializerInThread():
+        win, control, kind, name, err = _ui_target(window, element, _ACTIONABLE)
+        if err:
+            return err
+        _focus(win["hwnd"])
+        how = None
+        # Element classes expose only the patterns their type usually has, so look them up by name.
+        for getter, act, label in (("GetInvokePattern", lambda p: p.Invoke(), "invoked"),
+                                   ("GetTogglePattern", lambda p: p.Toggle(), "toggled"),
+                                   ("GetSelectionItemPattern", lambda p: p.Select(), "selected")):
+            try:
+                pattern = getattr(control, getter)() if hasattr(control, getter) else None
+                if pattern:
+                    act(pattern)
+                    how = label
+                    break
+            except Exception:
+                continue
+        if how is None:
+            control.Click(simulateMove=False)
+            how = "clicked"
+    time.sleep(0.8)
+    return f"{how.capitalize()} {kind} '{name}' in {win['title']!r}. The window is now titled {_window_title(win['hwnd'])!r}."
+
+
+@server.tool()
+def ui_type(window: str, element: str, text: str, press_enter: bool = False) -> str:
+    """Type `text` into a text box in a window, found by its name as read by ui_read (e.g. a search
+    box). Replaces what the box held. `press_enter` presses Enter afterwards, e.g. to run a
+    search. Never into password boxes or messaging windows."""
+    import uiautomation as auto
+    with auto.UIAutomationInitializerInThread():
+        win, control, kind, name, err = _ui_target(window, element, {"text box", "dropdown"})
+        if err:
+            return err
+        try:
+            if control.IsPassword:
+                return "Refused: that's a password box."
+        except Exception:
+            pass
+        _focus(win["hwnd"])
+        try:
+            control.GetValuePattern().SetValue(text)
+        except Exception:
+            control.SetFocus()
+            auto.SendKeys("{Ctrl}a", waitTime=0.05)
+            auto.SendKeys(text.replace("{", "{{}").replace("}", "{}}"), interval=0, waitTime=0.05)
+        if press_enter:
+            control.SetFocus()
+            auto.SendKeys("{Enter}", waitTime=0.3)
+    return f"Typed into {kind} '{name}' in {win['title']!r}" + (" and pressed Enter." if press_enter else ".")
 
 
 if __name__ == "__main__":

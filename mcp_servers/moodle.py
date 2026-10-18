@@ -7,7 +7,9 @@ can be called. Standard library only.
 """
 import ctypes
 import ctypes.wintypes as wt
+import html
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -16,6 +18,36 @@ READ_ONLY = {
     "core_webservice_get_site_info",
     "core_enrol_get_users_courses",
     "core_course_get_contents",
+    "tool_mobile_get_content",  # guarded below: only the attendance plugin's read-only view
+}
+
+
+def _guard(function: str, params: dict, marking: bool) -> None:
+    """Extra limits on general-purpose calls. tool_mobile_get_content runs any plugin's mobile
+    method; the attendance plugin's view also *records* attendance when given a session id (and a
+    status). Reads may pass only cmid, courseid and userid. Marking (Bhanu's own check-in, on his
+    request while his class runs) may add sessid, status and studentpass, and only through
+    Moodle.attendance_view(..., sessid=...)."""
+    if function != "tool_mobile_get_content":
+        return
+    names = {v for k, v in params.items() if k.startswith("args[") and k.endswith("[name]")}
+    allowed = {"cmid", "courseid", "userid"} | ({"sessid", "status", "studentpass"} if marking else set())
+    if (params.get("component") != "mod_attendance" or params.get("method") != "mobile_view_activity"
+            or not names <= allowed):
+        raise MoodleError("only the attendance plugin's view (and Bhanu's own check-in) is allowed through tool_mobile_get_content")
+
+
+# English labels for the attendance plugin's summary rows (mod_attendance language strings).
+_ATTENDANCE_LABELS = {
+    "sessionscompleted": "Taken sessions",
+    "pointssessionscompleted": "Points over taken sessions",
+    "percentagesessionscompleted": "Percentage over taken sessions",
+    "sessionstotal": "Total number of sessions",
+    "percentageallsessions": "Percentage over all sessions",
+    "maxpossiblepoints": "Maximum possible points",
+    "maxpossiblepercentage": "Maximum possible percentage",
+    # "pointsallsessions" is left out: UM's plugin version shows a percentage in that row, which
+    # contradicts its label.
 }
 
 
@@ -50,11 +82,12 @@ class Moodle:
         self.cache_seconds = cache_seconds
         self._cache: dict[tuple, tuple[float, object]] = {}
 
-    def call(self, function: str, **params):
+    def call(self, function: str, _marking: bool = False, **params):
         if function not in READ_ONLY:
             raise MoodleError(f"{function} is not on the read-only allowlist")
+        _guard(function, params, _marking)
         key = (function, tuple(sorted(params.items())))
-        hit = self._cache.get(key)
+        hit = None if _marking else self._cache.get(key)
         if hit and time.time() - hit[0] < self.cache_seconds:
             return hit[1]
         fields = {"wstoken": _load_token(self.credential), "wsfunction": function, **params}
@@ -68,7 +101,8 @@ class Moodle:
             raise MoodleError(f"couldn't reach {self.site}: {exc}") from None
         if isinstance(data, dict) and "exception" in data:
             raise MoodleError(f"{function} failed: {data.get('errorcode')} ({data.get('message')})")
-        self._cache[key] = (time.time(), data)
+        if not _marking:
+            self._cache[key] = (time.time(), data)
         return data
 
     def course_contents(self, course_id: int) -> list[dict]:
@@ -85,3 +119,50 @@ class Moodle:
                 sections.append({"name": sec.get("name", "").strip() or f"Section {sec.get('section')}",
                                  "modules": modules})
         return sections
+
+    def user_id(self) -> int:
+        return int(self.call("core_webservice_get_site_info")["userid"])
+
+    def attendance(self, course_id: int, fresh: bool = False) -> list[dict]:
+        """Bhanu's attendance summary for each Attendance activity in a course, read the way the
+        Moodle app does: [{"name", "rows": [(label, value), ...]}]. Per-session dates and statuses
+        are not part of this view."""
+        uid = self.user_id()
+        out = []
+        for sec in self.call("core_course_get_contents", courseid=course_id):
+            for mod in sec.get("modules", []):
+                if mod.get("modname") != "attendance" or not mod.get("uservisible", True):
+                    continue
+                page = self.attendance_view(course_id, mod["id"], fresh=fresh)["html"]
+                rows = []
+                for key, value in re.findall(
+                        r"plugin\.mod_attendance\.(\w+)'\s*\|\s*translate\s*}}\s*</ion-col>\s*<ion-col[^>]*>(.*?)</ion-col>",
+                        page, re.S):
+                    if key in _ATTENDANCE_LABELS:
+                        rows.append((_ATTENDANCE_LABELS[key], " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value)).split())))
+                out.append({"name": mod.get("name", "Attendance").strip(), "cmid": mod["id"], "rows": rows})
+        return out
+
+    def attendance_view(self, course_id: int, cmid: int, sessid: int | None = None,
+                        status: int | None = None, fresh: bool = False) -> dict:
+        """The attendance plugin's Moodle-app page for an activity: {"html", "javascript",
+        "otherdata"}. With `sessid` this is Bhanu's own check-in for that session (with `status`,
+        the status he records); it is never cached, and only mark_attendance calls it."""
+        args = [("cmid", cmid), ("courseid", course_id), ("userid", self.user_id())]
+        if sessid is not None:
+            args.append(("sessid", sessid))
+            if status is not None:
+                args.append(("status", status))
+        params = {}
+        for i, (name, value) in enumerate(args):
+            params[f"args[{i}][name]"] = name
+            params[f"args[{i}][value]"] = value
+        marking = sessid is not None
+        if fresh and not marking:
+            self._cache.pop(("tool_mobile_get_content", tuple(sorted(
+                {"component": "mod_attendance", "method": "mobile_view_activity", **params}.items()))), None)
+        data = self.call("tool_mobile_get_content", _marking=marking, component="mod_attendance",
+                         method="mobile_view_activity", **params)
+        return {"html": "".join(t.get("html", "") for t in data.get("templates", [])),
+                "javascript": data.get("javascript") or "",
+                "otherdata": json.dumps(data.get("otherdata") or [])}

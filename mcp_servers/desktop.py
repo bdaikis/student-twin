@@ -9,6 +9,8 @@ files, creating new text files (never overwriting), reading attendance, and read
 window's labelled elements through UI Automation (ui_read, ui_click, ui_type), which refuse
 messaging windows and elements that look irreversible. Irreversible tools (step 2d-ii:
 delete_files) act only after Bhanu clicks Confirm on the widget's confirm card; see confirm.py.
+Screen control (screen_look, screen_click, screen_type, screen_scroll) is the last resort, for what
+the accessibility tree can't reach, and refuses the same windows and elements.
 
 Course contents come from the portal's Moodle API through moodle.py (read-only allowlist).
 Per-user settings (course pages, browser profiles, default music, home city) come from
@@ -17,6 +19,7 @@ Runs in the isolated student-twin venv: mcp, winrt-Windows.Media.Control, uiauto
 """
 import asyncio
 import ctypes
+import io
 import ctypes.wintypes as wt
 import difflib
 import json
@@ -1009,6 +1012,243 @@ def ui_type(window: str, element: str, text: str, press_enter: bool = False) -> 
             control.SetFocus()
             auto.SendKeys("{Enter}", waitTime=0.3)
     return f"Typed into {kind} '{name}' in {win['title']!r}" + (" and pressed Enter." if press_enter else ".")
+
+
+# --- Screen control (step 2d-iii, layer 3): look at a window, then click, type or scroll ---------
+# For what the accessibility tree can't reach: canvas and game content, apps with poor labels,
+# visual questions. A look is a screenshot of one window, never the whole screen and never a
+# messaging window, so other people's messages don't reach the model. Before every click the
+# element under the point is read through UI Automation, and irreversible-looking elements and
+# password boxes are refused, so deleting still goes only through delete_files and its confirm
+# card. Coordinates are those of the window's last look.
+
+_LOOK_MAX = 1366  # longest side of the image sent to the model, in pixels
+_looks: dict[int, dict] = {}  # hwnd -> {"rect": (left, top, right, bottom), "scale": float}
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", wt.LONG), ("y", wt.LONG)]
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG), ("biPlanes", wt.WORD),
+                ("biBitCount", wt.WORD), ("biCompression", wt.DWORD), ("biSizeImage", wt.DWORD),
+                ("biXPelsPerMeter", wt.LONG), ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD),
+                ("biClrImportant", wt.DWORD)]
+
+
+_gdi32 = ctypes.windll.gdi32
+user32.GetWindowDC.restype = wt.HDC
+user32.GetWindowDC.argtypes = [wt.HWND]
+user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+user32.PrintWindow.argtypes = [wt.HWND, wt.HDC, wt.UINT]
+user32.WindowFromPoint.argtypes = [POINT]
+user32.WindowFromPoint.restype = wt.HWND
+user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+user32.GetAncestor.restype = wt.HWND
+_gdi32.CreateCompatibleDC.restype = wt.HDC
+_gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
+_gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
+_gdi32.CreateCompatibleBitmap.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int]
+_gdi32.SelectObject.restype = wt.HGDIOBJ
+_gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+_gdi32.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT, ctypes.c_void_p, ctypes.c_void_p, wt.UINT]
+_gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
+_gdi32.DeleteDC.argtypes = [wt.HDC]
+
+
+def _window_rect(hwnd) -> tuple[int, int, int, int]:
+    r = RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    return r.left, r.top, r.right, r.bottom
+
+
+def _capture(hwnd):
+    """(PIL image, rect) of one window as it draws itself, even where other windows cover it
+    (PrintWindow with PW_RENDERFULLCONTENT). Falls back to grabbing that part of the screen when the
+    window can't draw itself (some games), after bringing it to the front."""
+    from PIL import Image as PILImage, ImageGrab
+    rect = _window_rect(hwnd)
+    w, h = rect[2] - rect[0], rect[3] - rect[1]
+    hdc = user32.GetWindowDC(hwnd)
+    mem = _gdi32.CreateCompatibleDC(hdc)
+    bmp = _gdi32.CreateCompatibleBitmap(hdc, w, h)
+    old = _gdi32.SelectObject(mem, bmp)
+    try:
+        ok = user32.PrintWindow(hwnd, mem, 2)  # PW_RENDERFULLCONTENT
+        info = BITMAPINFOHEADER(biSize=ctypes.sizeof(BITMAPINFOHEADER), biWidth=w, biHeight=-h, biPlanes=1,
+                                biBitCount=32, biCompression=0)
+        buf = ctypes.create_string_buffer(w * h * 4)
+        _gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(info), 0)
+    finally:
+        _gdi32.SelectObject(mem, old)
+        _gdi32.DeleteObject(bmp)
+        _gdi32.DeleteDC(mem)
+        user32.ReleaseDC(hwnd, hdc)
+    img = PILImage.frombuffer("RGB", (w, h), buf, "raw", "BGRX", 0, 1)
+    if not ok or img.getextrema() in (((0, 0), (0, 0), (0, 0)),):
+        _focus(hwnd)
+        time.sleep(0.3)
+        img = ImageGrab.grab(bbox=rect, all_screens=True)
+    return img, rect
+
+
+@server.tool()
+def screen_look(window: str):
+    """Take a screenshot of one window, for what ui_read can't see: games and other canvas content,
+    images, charts, apps whose buttons have no names, or "what does this look like". Then act with
+    screen_click / screen_type / screen_scroll using x, y in this image. Prefer ui_read first: it is
+    cheaper and exact. Never the whole screen, never messaging windows."""
+    from mcp.server.mcpserver import Image
+    win, err = _ui_window(window)
+    if err:
+        return err
+    img, rect = _capture(win["hwnd"])
+    w, h = img.size
+    scale = min(1.0, _LOOK_MAX / max(w, h))
+    if scale < 1.0:
+        img = img.resize((round(w * scale), round(h * scale)))
+    _looks[win["hwnd"]] = {"rect": rect, "scale": scale}
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=80)
+    note = (f"{win['title']!r} ({win['process']}), {img.size[0]} x {img.size[1]} pixels. Use x, y in this image "
+            f"with screen_click.") + (" It was minimized; restored it." if win.get("restored") else "")
+    return [note, Image(data=out.getvalue(), format="jpeg")]
+
+
+def _screen_point(win, x: float, y: float):
+    """Screen pixel for image point (x, y) of the window's last look, or an error sentence."""
+    look = _looks.get(win["hwnd"])
+    if not look:
+        return None, f"Look at {win['title']!r} with screen_look first."
+    if _window_rect(win["hwnd"]) != look["rect"]:
+        return None, f"{win['title']!r} has moved or resized since the last look; look again first."
+    left, top, right, bottom = look["rect"]
+    sx, sy = left + round(x / look["scale"]), top + round(y / look["scale"])
+    if not (left <= sx < right and top <= sy < bottom):
+        return None, f"({x}, {y}) is outside the window's image."
+    return (sx, sy), None
+
+
+def _target_check(win, sx: int, sy: int) -> tuple[str, str | None]:
+    """(description of the element under the point, refusal or None). Refuses points another window
+    covers, irreversible-looking elements (or their button/link/menu parents) and password boxes."""
+    import uiautomation as auto
+    under = user32.GetAncestor(user32.WindowFromPoint(POINT(sx, sy)), 2)  # GA_ROOT
+    if under != win["hwnd"]:
+        return "", f"Another window covers that point ({_window_title(under)!r}); bring {win['title']!r} forward and look again."
+    with auto.UIAutomationInitializerInThread():
+        el = auto.ControlFromPoint(sx, sy)
+        # Chromium builds its accessibility tree on first request; an unnamed element in a browser
+        # may be a page that isn't described yet, so ask once more before trusting it.
+        if win["process"].lower() in BROWSERS and el and not (el.Name or "").strip():
+            time.sleep(0.4)
+            el = auto.ControlFromPoint(sx, sy)
+        chain, c = [], el
+        for _ in range(4):  # the element and the controls it sits in, up to its button or link
+            if not c:
+                break
+            chain.append((c.ControlTypeName, " ".join((c.Name or "").split())[:80]))
+            if c.ControlTypeName in ("WindowControl", "PaneControl", "DocumentControl"):
+                break
+            c = c.GetParentControl()
+        try:
+            password = el.ControlTypeName == "EditControl" and bool(el.IsPassword)
+        except Exception:
+            password = False
+    for _, name in chain:
+        if _IRREVERSIBLE.search(name):
+            return name, (f"Refused: that point is on '{name}', which looks irreversible. Deleting goes through "
+                          "delete_files; other irreversible actions are for Bhanu to do himself.")
+    if password:
+        return "password box", "Refused: that's a password box."
+    kind, name = chain[0] if chain else ("", "")
+    return (f"{_UI_KINDS.get(kind, kind.replace('Control', '').lower())} '{name}'" if name else "an unlabelled spot"), None
+
+
+def _mouse(flags: int, data: int = 0) -> None:
+    m = INPUT(type=0, u=_INPUTUNION(mi=MOUSEINPUT(dwFlags=flags, mouseData=ctypes.c_ulong(data & 0xFFFFFFFF).value)))
+    user32.SendInput(1, ctypes.byref(m), ctypes.sizeof(INPUT))
+
+
+def _at_point(sx: int, sy: int, action) -> None:
+    """Move the cursor to (sx, sy), do `action`, and put the cursor back where Bhanu left it."""
+    back = POINT()
+    user32.GetCursorPos(ctypes.byref(back))
+    user32.SetCursorPos(sx, sy)
+    time.sleep(0.05)
+    try:
+        action()
+    finally:
+        time.sleep(0.05)
+        user32.SetCursorPos(back.x, back.y)
+
+
+@server.tool()
+def screen_click(window: str, x: float, y: float, double: bool = False) -> str:
+    """Click at x, y of the window's last screen_look image (double-click with `double`). Refuses
+    points on elements that look irreversible (delete, submit, send, pay...), password boxes and
+    messaging windows. Look again afterwards to see the result."""
+    win, err = _ui_window(window)
+    if err:
+        return err
+    point, err = _screen_point(win, x, y)
+    if err:
+        return err
+    if not _focus(win["hwnd"]):
+        return f"Windows didn't let me bring {win['title']!r} to the front, so nothing was clicked."
+    what, refusal = _target_check(win, *point)
+    if refusal:
+        return refusal
+    clicks = 2 if double else 1
+    _at_point(*point, lambda: [(_mouse(0x0002), _mouse(0x0004)) for _ in range(clicks)])  # LEFTDOWN, LEFTUP
+    time.sleep(0.6)
+    return (f"{'Double-clicked' if double else 'Clicked'} {what} at ({x:g}, {y:g}) in {win['title']!r}. "
+            f"The window is now titled {_window_title(win['hwnd'])!r}; look again to see the result.")
+
+
+@server.tool()
+def screen_type(window: str, text: str, press_enter: bool = False) -> str:
+    """Type `text` where the keyboard focus is in a window, e.g. after screen_click on a text field
+    (ui_type is better when the field has a name). `press_enter` presses Enter afterwards. Never
+    into password boxes or messaging windows."""
+    import uiautomation as auto
+    win, err = _ui_window(window)
+    if err:
+        return err
+    if not _focus(win["hwnd"]) or user32.GetForegroundWindow() != win["hwnd"]:
+        return f"Windows didn't let me bring {win['title']!r} to the front, so nothing was typed."
+    with auto.UIAutomationInitializerInThread():
+        focused = auto.GetFocusedControl()
+        try:
+            if focused and focused.ControlTypeName == "EditControl" and focused.IsPassword:
+                return "Refused: the focus is on a password box."
+        except Exception:
+            pass
+        auto.SendKeys(text.replace("{", "{{}").replace("}", "{}}"), interval=0, waitTime=0.05)
+        if press_enter:
+            auto.SendKeys("{Enter}", waitTime=0.3)
+    return f"Typed into {win['title']!r}" + (" and pressed Enter." if press_enter else ".")
+
+
+@server.tool()
+def screen_scroll(window: str, direction: str = "down", amount: int = 5) -> str:
+    """Scroll a window up or down by `amount` notches (about three lines each), with the mouse wheel
+    over the middle of the window. Look again afterwards."""
+    win, err = _ui_window(window)
+    if err:
+        return err
+    d = direction.strip().lower()
+    if d not in ("up", "down"):
+        return "direction must be up or down."
+    amount = max(1, min(int(amount), 30))
+    if not _focus(win["hwnd"]):
+        return f"Windows didn't let me bring {win['title']!r} to the front, so nothing was scrolled."
+    left, top, right, bottom = _window_rect(win["hwnd"])
+    delta = 120 * amount * (1 if d == "up" else -1)
+    _at_point((left + right) // 2, (top + bottom) // 2, lambda: _mouse(0x0800, delta))  # MOUSEEVENTF_WHEEL
+    time.sleep(0.4)
+    return f"Scrolled {d} {amount} notches in {win['title']!r}; look again to see the result."
 
 
 if __name__ == "__main__":

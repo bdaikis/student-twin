@@ -55,6 +55,29 @@ class MoodleError(RuntimeError):
     pass
 
 
+def _text(fragment: str) -> str:
+    return " ".join(html.unescape(re.sub(r"<[^>]+>|\{\{.*?\}\}", " ", fragment)).split())
+
+
+def _sessions(page: str) -> list[dict]:
+    """Session items in the attendance view: an <h2> with the date and time, then <h3>s with the
+    description and, once marked, the status (seen 19 Oct 2026: "Mon 19 Oct 2026 8AM - 9AM", "",
+    "Present")."""
+    out = []
+    for chunk in re.split(r"<ion-item\b", page)[1:]:
+        when = re.search(r"<h2[^>]*>(.*?)</h2>", chunk, re.S)
+        if not when:
+            continue
+        h3 = [_text(t) for t in re.findall(r"<h3[^>]*>(.*?)</h3>", chunk, re.S)]
+        out.append({
+            "when": _text(when[1]),
+            "description": h3[0] if h3 else "",
+            "status": h3[-1] if len(h3) >= 2 else "",
+            "open": bool(re.search(r"sessid", chunk)),
+        })
+    return out
+
+
 class _CREDENTIAL(ctypes.Structure):
     _fields_ = [("Flags", wt.DWORD), ("Type", wt.DWORD), ("TargetName", wt.LPWSTR), ("Comment", wt.LPWSTR),
                 ("LastWritten", wt.FILETIME), ("CredentialBlobSize", wt.DWORD),
@@ -124,9 +147,12 @@ class Moodle:
         return int(self.call("core_webservice_get_site_info")["userid"])
 
     def attendance(self, course_id: int, fresh: bool = False) -> list[dict]:
-        """Bhanu's attendance summary for each Attendance activity in a course, read the way the
-        Moodle app does: [{"name", "rows": [(label, value), ...]}]. Per-session dates and statuses
-        are not part of this view."""
+        """Bhanu's attendance for each Attendance activity in a course, read the way the Moodle
+        app does: [{"name", "cmid", "rows": [(label, value), ...], "sessions": [...]}]. "rows" are
+        the summary totals. "sessions" are the sessions the app's view lists, which in practice are
+        the current day's: {"when": "Mon 19 Oct 2026 8AM - 9AM", "description", "status": "Present"
+        or "" when not marked, "open": whether the item carries a self-marking session id}. Earlier
+        sessions appear only in the totals."""
         uid = self.user_id()
         out = []
         for sec in self.call("core_course_get_contents", courseid=course_id):
@@ -140,7 +166,8 @@ class Moodle:
                         page, re.S):
                     if key in _ATTENDANCE_LABELS:
                         rows.append((_ATTENDANCE_LABELS[key], " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value)).split())))
-                out.append({"name": mod.get("name", "Attendance").strip(), "cmid": mod["id"], "rows": rows})
+                out.append({"name": mod.get("name", "Attendance").strip(), "cmid": mod["id"], "rows": rows,
+                            "sessions": _sessions(page)})
         return out
 
     def attendance_view(self, course_id: int, cmid: int, sessid: int | None = None,

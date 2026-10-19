@@ -7,8 +7,10 @@ Whatever this prints is sent to Bhanu on Telegram; printing nothing sends nothin
 - When a class starts: a reminder. For a lecture with SPeCTRUM attendance, "reply 'here' and I'll
   check you in"; for a lab, "taken in person"; for a course with no attendance activity, "only the
   paper sheet counts".
-- 15 minutes in: if SPeCTRUM's totals for that class haven't changed since the reminder, a second
-  message while there is still time to check in.
+- 15 minutes in: unless SPeCTRUM already shows him present for that session, a second message
+  while there is still time to check in (or saying what SPeCTRUM recorded instead, such as Absent).
+  Decided by the session's status, not the totals: a lecturer taking the register with him absent
+  also changes the totals.
 
 The twin never checks in from here; mark_attendance does, only when Bhanu replies. While a class
 runs, the attendance page is also saved (read-only) to the data folder, so the check-in step can be
@@ -23,7 +25,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mcp_servers"))
 
 import timetable  # noqa: E402
-from common import DATA, course_id, match_course, moodle  # noqa: E402
+from common import (DATA, PRESENT, course_id, match_course, moodle, remember_sessions,  # noqa: E402
+                    remembered_session, session_for, totals_verdict)
 
 STATE = DATA / "reminders_state.json"
 SNAPSHOTS = DATA / "attendance_snapshots"
@@ -108,12 +111,23 @@ def main() -> None:
             continue
         entry["followed_up"] = True
         try:
-            after = totals(cid)
-            snapshot(b.code, cid, after)
+            acts = [a for a in moodle().attendance(cid, fresh=True)
+                    if dict(a["rows"]).get("Total number of sessions") != "0"]
+            snapshot(b.code, cid, [a["cmid"] for a in acts])
+            remember_sessions(b.code, acts)
         except Exception:
             continue
-        if after == entry.get("before"):
-            messages.append(f"{b.code}: SPeCTRUM still shows no new check-in, 15 minutes in. "
+        session = session_for(b, acts) or remembered_session(b.code, b)
+        status = session["status"] if session else ""
+        if PRESENT.search(status):
+            continue  # already marked present
+        if not session and totals_verdict(b, acts)[0]:
+            continue  # SPeCTRUM no longer lists the session, but its totals show him present
+        if status:
+            messages.append(f"{b.code}: SPeCTRUM shows you {status} for {b.start:%H:%M}–{b.end:%H:%M}. "
+                            f"If you're there, tell the lecturer, and sign the paper sheet.")
+        else:
+            messages.append(f"{b.code}: SPeCTRUM shows no check-in yet, 15 minutes in. "
                             f"Reply \"here\" and I'll check you in, or do it yourself before {b.end:%H:%M}.")
     save_state(state)
     if messages:

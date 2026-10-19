@@ -18,14 +18,16 @@ from datetime import timedelta
 from mcp.server.mcpserver import MCPServer
 
 import timetable
-from common import DATA, course_contents, course_id, match_course, moodle
+from common import (DATA, PRESENT, course_contents, course_id, match_course, moodle, remember_sessions,
+                    remembered_session, session_for, totals_verdict)
 
 server = MCPServer(
     "portal",
     instructions=(
         "Bhanu's university timetable, course material and attendance on SPeCTRUM (UM's Moodle). "
         "When he says he is in class (\"here\", \"I'm here\", \"check me in\", \"mark me\"), usually in "
-        "reply to a class reminder, call mark_attendance."
+        "reply to a class reminder, call mark_attendance. For whether he has been marked today, call "
+        "attendance_today."
     ),
 )
 
@@ -81,9 +83,9 @@ def _summary(rows: dict) -> str:
 
 @server.tool()
 def attendance(course: str = "") -> str:
-    """Bhanu's attendance on the university portal, per course: sessions taken, points and
-    percentage. `course` is a code or part of a name; empty means every course. Totals only, not a
-    per-session list."""
+    """Bhanu's attendance totals on the university portal, per course: sessions taken, points and
+    percentage, plus today's session and its status where SPeCTRUM lists one. `course` is a code or
+    part of a name; empty means every course. For "was I marked today?" use attendance_today."""
     from moodle import MoodleError
     from common import config
     codes = [course] if course.strip() else list(config().get("courses", {}))
@@ -97,13 +99,80 @@ def attendance(course: str = "") -> str:
         if not cid:
             continue
         try:
-            for act in _activities(code, cid):
-                lines.append(f"- {code} {info['name']} ({act['name']}): {_summary(dict(act['rows']))}")
+            acts = _activities(code, cid, fresh=True)
+            remember_sessions(code, acts)
+            for act in acts:
+                today = "".join(f"; {s['when']}: {s['status'] or 'not marked yet'}" for s in act.get("sessions", []))
+                lines.append(f"- {code} {info['name']} ({act['name']}): {_summary(dict(act['rows']))}{today}")
         except MoodleError as exc:
             errors.append(f"{code}: {exc}")
     if not lines and not errors:
         return "No Attendance activity with sessions" + (f" in {codes[0]}." if course.strip() else " in any course.")
     return "\n".join(lines + ([f"Couldn't read: {'; '.join(errors)}"] if errors else []))
+
+
+@server.tool()
+def attendance_today() -> str:
+    """Whether Bhanu has been marked for each of today's classes, read live from SPeCTRUM: for each
+    class in his timetable today, the session SPeCTRUM lists and its status (Present, Absent, Late,
+    Excused) or "not marked yet". Use it for "was I marked?", "did my check-in go through?" or
+    "check my attendance for today". Read-only: it never checks him in (that is mark_attendance)."""
+    from moodle import MoodleError
+    try:
+        now = timetable.now()
+        blocks = timetable.on_day(now)
+    except RuntimeError as exc:
+        return str(exc)
+    if not blocks:
+        return f"No classes today ({now:%A %d %b})."
+    fetched: dict[str, list[dict] | str] = {}
+    lines = []
+    for b in blocks:
+        head = f"{b.start:%H:%M}–{b.end:%H:%M} {b.code} {b.name.title()} {b.activity.lower()}"
+        if b.activity == "LAB":
+            lines.append(f"- {head}: labs are marked in person, not on SPeCTRUM.")
+            continue
+        match = match_course(b.code)
+        if isinstance(match, str):
+            lines.append(f"- {head}: not in the twin's course list.")
+            continue
+        code, info = match
+        if code not in fetched:
+            try:
+                fetched[code] = _activities(code, course_id(info), fresh=True)
+            except MoodleError as exc:
+                fetched[code] = f"couldn't reach SPeCTRUM ({exc})"
+        acts = fetched[code]
+        if isinstance(acts, str):
+            lines.append(f"- {head}: {acts}.")
+            continue
+        if not acts:
+            lines.append(f"- {head}: no attendance on SPeCTRUM for this course; only the paper sheet counts.")
+            continue
+        remember_sessions(code, acts)
+        s = session_for(b, acts)
+        if s and s["status"]:
+            lines.append(f"- {head}: {_status(s['status'])} on SPeCTRUM.")
+            continue
+        if s:
+            state = "check-in is open" if s["open"] else "not marked yet"
+            lines.append(f"- {head}: {state} on SPeCTRUM" + (" (class not started yet)." if now < b.start else "."))
+            continue
+        if now < b.start:
+            lines.append(f"- {head}: hasn't started; SPeCTRUM lists no session for it yet.")
+            continue
+        # SPeCTRUM lists a session only around its own time; after that, use what was seen then.
+        seen = remembered_session(code, b)
+        if seen:
+            lines.append(f"- {head}: {_status(seen['status'])} (as SPeCTRUM showed at {seen['seen'][-5:]}; "
+                         f"it no longer lists the session).")
+            continue
+        lines.append(f"- {head}: {totals_verdict(b, acts)[1]}")
+    return f"{now:%A %d %b}, as of {now:%H:%M}:\n" + "\n".join(lines)
+
+
+def _status(status: str) -> str:
+    return f"✓ {status}" if PRESENT.search(status) else status
 
 
 def _snapshot(code: str, step: str, page: dict) -> str:
@@ -181,7 +250,7 @@ def mark_attendance(course: str = "") -> str:
                 form = moodle().attendance_view(cid, act["cmid"], sessid=sessid)
                 snapshots.append(_snapshot(code, f"form-{sessid}", form))
                 options = _statuses(form["html"])
-                present = [sid for sid, label in options if re.search(r"(?i)\b(present|hadir)\b", label)]
+                present = [sid for sid, label in options if PRESENT.search(label)]
                 result = form
                 if present:
                     result = moodle().attendance_view(cid, act["cmid"], sessid=sessid, status=present[0])

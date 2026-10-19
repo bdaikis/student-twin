@@ -4,9 +4,11 @@
 
 Whatever this prints is sent to Bhanu on Telegram; printing nothing sends nothing.
 
-- When a class starts: a reminder. For a lecture with SPeCTRUM attendance, "reply 'here' and I'll
-  check you in"; for a lab, "taken in person"; for a course with no attendance activity, "only the
-  paper sheet counts".
+- When a class starts: a reminder. For a lecture with SPeCTRUM attendance, SPeCTRUM is read first:
+  if it already shows him marked, the reminder says so (and to sign the sheet); otherwise "reply
+  'here' and I'll check you in". For a lab, "taken in person"; for a course with no attendance
+  activity, "only the paper sheet counts". Bhanu's rule (2026-10-19): always check SPeCTRUM before
+  telling him he hasn't marked his attendance.
 - 15 minutes in: unless SPeCTRUM already shows him present for that session, a second message
   while there is still time to check in (or saying what SPeCTRUM recorded instead, such as Absent).
   Decided by the session's status, not the totals: a lecturer taking the register with him absent
@@ -50,16 +52,6 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE)
 
 
-def totals(cid: int) -> dict:
-    """{cmid: {label: value}} for the course's attendance activities that have sessions."""
-    out = {}
-    for act in moodle().attendance(cid, fresh=True):
-        rows = dict(act["rows"])
-        if rows.get("Total number of sessions") != "0":
-            out[str(act["cmid"])] = rows
-    return out
-
-
 def snapshot(code: str, cid: int, cmids) -> None:
     SNAPSHOTS.mkdir(parents=True, exist_ok=True)
     for cmid in cmids:
@@ -94,15 +86,27 @@ def main() -> None:
                 entry["reminded"] = entry["followed_up"] = True  # started too long ago to be useful
                 continue
             try:
-                before = totals(cid) if cid else {}
+                acts = [a for a in moodle().attendance(cid, fresh=True)
+                        if dict(a["rows"]).get("Total number of sessions") != "0"] if cid else []
+                remember_sessions(b.code, acts)
             except Exception as exc:
                 messages.append(f"{heading(b)} I couldn't reach SPeCTRUM ({exc}); check in yourself and sign the sheet.")
                 entry["reminded"] = entry["followed_up"] = True
                 continue
-            entry["before"] = before
+            entry["before"] = {str(a["cmid"]): dict(a["rows"]) for a in acts}
             entry["reminded"] = True
-            if not before:
+            # SPeCTRUM first: never ask him to check in for a session it already shows him marked for.
+            session = session_for(b, acts)
+            status = session["status"] if session else ""
+            if not acts:
                 messages.append(f"{heading(b)} {b.code} has no attendance on SPeCTRUM; only the paper sheet counts.")
+                entry["followed_up"] = True
+            elif PRESENT.search(status):
+                messages.append(f"{heading(b)} SPeCTRUM already shows you {status}. Sign the paper sheet too.")
+                entry["followed_up"] = True
+            elif status:
+                messages.append(f"{heading(b)} SPeCTRUM shows you {status} for this class. If you're there, tell the "
+                                f"lecturer, and sign the paper sheet.")
                 entry["followed_up"] = True
             else:
                 messages.append(f"{heading(b)} Reply \"here\" and I'll check you in on SPeCTRUM. Sign the paper sheet too.")

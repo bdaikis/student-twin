@@ -379,7 +379,10 @@ function startHelper() {
       case 'transcript': {
         const file = pendingAudio.get(ev.id);
         pendingAudio.delete(ev.id);
-        if (file) fs.rm(file, { force: true }, () => {});
+        if (file) {
+          if (keepRecordings()) keepRecording(file, ev);
+          else fs.rm(file, { force: true }, () => {});
+        }
         toRenderer('voice:transcript', ev);
         break;
       }
@@ -394,6 +397,27 @@ function startHelper() {
     helper = null;
     toRenderer('voice:status', { ok: false, message: 'Voice stopped. Restart the widget to turn it back on.' });
   });
+}
+
+// Opt-in, for comparing speech models on Bhanu's own voice (scripts/compare_whisper.py): with
+// "voice": {"keep_recordings": true} in the per-user config, each push-to-talk clip is kept in
+// <data>/voice_samples/ with what was heard, instead of being deleted. Off by default; the clips
+// never leave the machine.
+function keepRecordings() {
+  try {
+    return Boolean(JSON.parse(fs.readFileSync(path.join(TWIN_DATA, 'config.json'), 'utf8')).voice?.keep_recordings);
+  } catch { return false; }
+}
+
+function keepRecording(file, ev) {
+  const dir = path.join(TWIN_DATA, 'voice_samples');
+  const name = `${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.renameSync(file, path.join(dir, name));
+    fs.appendFileSync(path.join(dir, 'samples.jsonl'),
+      `${JSON.stringify({ file: name, heard: ev.text || '', ok: Boolean(ev.ok), ms: ev.ms, at: new Date().toISOString() })}\n`);
+  } catch { fs.rm(file, { force: true }, () => {}); }
 }
 
 function transcribeWav(id, wavBytes) {

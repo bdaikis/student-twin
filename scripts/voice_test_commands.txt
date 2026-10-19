@@ -1,0 +1,21 @@
+# Read one per push-to-talk hold, in order, the way you'd normally say it. Lines starting with # are skipped.
+Open Spotify
+Play my playlist
+Pause the music
+Open Minecraft
+Close Minecraft
+Minimize Google Chrome
+Maximize VS Code
+Open the PyTorch docs and put them next to VS Code
+Open Netflix
+Close the Netflix tab
+What's the air quality in KL?
+What's the weather like today?
+Open my SIF1014 notes on SPeCTRUM
+Open Lecture 1 of SIF1003
+Check my attendance for today
+Create a text file called notes in the twin-test folder
+Delete the files in the twin-test folder
+Open File Explorer and go to Downloads
+Put the terminal in focus
+Close the Chrome tab I just opened

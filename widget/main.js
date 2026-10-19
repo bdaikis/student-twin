@@ -9,6 +9,15 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
+// One widget at a time. A second launch exits at once, before Chromium opens its caches (which
+// the running copy holds, hence a burst of "Unable to move the cache" errors), and the running
+// copy comes out of hiding instead.
+if (!app.requestSingleInstanceLock()) {
+  console.log('Student Twin is already running; showing it.');
+  process.exit(0);
+}
+app.on('second-instance', () => showWidget());
+
 // Hermes's OpenAI-compatible api_server, loopback only. Its key never leaves this process.
 const HERMES_URL = 'http://127.0.0.1:8642/v1/chat/completions';
 const HERMES_HEALTH = 'http://127.0.0.1:8642/health';
@@ -515,4 +524,3 @@ app.on('will-quit', () => {
   if (helper) { try { helper.stdin.write('{"cmd":"quit"}\n'); } catch {} helper.kill(); }
 });
 
-if (!app.requestSingleInstanceLock()) app.quit();

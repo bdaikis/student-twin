@@ -5,10 +5,10 @@
 Whatever this prints is sent to Bhanu on Telegram; printing nothing sends nothing.
 
 - When a class starts: a reminder. For a lecture with SPeCTRUM attendance, SPeCTRUM is read first:
-  if it already shows him marked, the reminder says so (and to sign the sheet); otherwise "reply
-  'here' and I'll check you in". For a lab, "taken in person"; for a course with no attendance
-  activity, "only the paper sheet counts". Bhanu's rule (2026-10-19): always check SPeCTRUM before
-  telling him he hasn't marked his attendance.
+  if it already shows him marked, the reminder says so; otherwise "reply 'here' and I'll check you
+  in". For a lab, "taken in person". A course with no SPeCTRUM attendance gets no reminder. Bhanu's
+  rules (2026-10-19): always check SPeCTRUM before telling him he hasn't marked his attendance, and
+  no reminders to sign the paper sheet.
 - 15 minutes in: unless SPeCTRUM already shows him present for that session, a second message
   while there is still time to check in (or saying what SPeCTRUM recorded instead, such as Absent).
   Decided by the session's status, not the totals: a lecturer taking the register with him absent
@@ -90,7 +90,7 @@ def main() -> None:
                         if dict(a["rows"]).get("Total number of sessions") != "0"] if cid else []
                 remember_sessions(b.code, acts)
             except Exception as exc:
-                messages.append(f"{heading(b)} I couldn't reach SPeCTRUM ({exc}); check in yourself and sign the sheet.")
+                messages.append(f"{heading(b)} I couldn't reach SPeCTRUM ({exc}); check in yourself.")
                 entry["reminded"] = entry["followed_up"] = True
                 continue
             entry["before"] = {str(a["cmid"]): dict(a["rows"]) for a in acts}
@@ -99,17 +99,16 @@ def main() -> None:
             session = session_for(b, acts)
             status = session["status"] if session else ""
             if not acts:
-                messages.append(f"{heading(b)} {b.code} has no attendance on SPeCTRUM; only the paper sheet counts.")
-                entry["followed_up"] = True
+                entry["followed_up"] = True  # no SPeCTRUM attendance, nothing to remind him of
             elif PRESENT.search(status):
-                messages.append(f"{heading(b)} SPeCTRUM already shows you {status}. Sign the paper sheet too.")
+                messages.append(f"{heading(b)} SPeCTRUM already shows you {status}.")
                 entry["followed_up"] = True
             elif status:
                 messages.append(f"{heading(b)} SPeCTRUM shows you {status} for this class. If you're there, tell the "
-                                f"lecturer, and sign the paper sheet.")
+                                f"lecturer.")
                 entry["followed_up"] = True
             else:
-                messages.append(f"{heading(b)} Reply \"here\" and I'll check you in on SPeCTRUM. Sign the paper sheet too.")
+                messages.append(f"{heading(b)} Reply \"here\" and I'll check you in on SPeCTRUM.")
             continue
         if entry.get("followed_up") or now < b.start + FOLLOW_UP:
             continue
@@ -129,7 +128,7 @@ def main() -> None:
             continue  # SPeCTRUM no longer lists the session, but its totals show him present
         if status:
             messages.append(f"{b.code}: SPeCTRUM shows you {status} for {b.start:%H:%M}–{b.end:%H:%M}. "
-                            f"If you're there, tell the lecturer, and sign the paper sheet.")
+                            f"If you're there, tell the lecturer.")
         else:
             messages.append(f"{b.code}: SPeCTRUM shows no check-in yet, 15 minutes in. "
                             f"Reply \"here\" and I'll check you in, or do it yourself before {b.end:%H:%M}.")

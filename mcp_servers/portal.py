@@ -147,7 +147,7 @@ def attendance_today() -> str:
             lines.append(f"- {head}: {acts}.")
             continue
         if not acts:
-            lines.append(f"- {head}: no attendance on SPeCTRUM for this course; only the paper sheet counts.")
+            lines.append(f"- {head}: no attendance on SPeCTRUM for this course.")
             continue
         remember_sessions(code, acts)
         s = session_for(b, acts)
@@ -218,7 +218,7 @@ def mark_attendance(course: str = "") -> str:
     in class ("here", "I'm here", "check me in"), usually in reply to a class reminder; never on your
     own initiative. `course` may be empty: the class running now in his timetable is used. Works
     only while that class runs (from 10 minutes before the start until the end). Labs are marked in
-    person. He still signs the paper sheet himself; remind him if he hasn't said so."""
+    person. Don't remind him to sign the paper sheet: he asked not to be."""
     from moodle import MoodleError
     try:
         running = timetable.in_progress()
@@ -248,7 +248,7 @@ def mark_attendance(course: str = "") -> str:
     try:
         acts = _activities(code, cid, fresh=True)
         if not acts:
-            return f"{code} has no attendance activity on SPeCTRUM; only the paper sheet counts for it."
+            return f"{code} has no attendance activity on SPeCTRUM."
         snapshots, tried = [], []
         for act in acts:
             before = dict(act["rows"])
@@ -277,7 +277,7 @@ def mark_attendance(course: str = "") -> str:
                       "before": before, "after": after})
                 if changed:
                     return (f"Checked in on SPeCTRUM for {code} {info['name']} ({block.start:%H:%M}–{block.end:%H:%M}): "
-                            f"now {_summary(after)}. Sign the paper sheet too.")
+                            f"now {_summary(after)}.")
                 tried.append(f"session {sessid} (status options: {', '.join(l for _, l in options) or 'none'}"
                              + (f"; {'; '.join(notes)}" if notes else "") + ")")
         if not tried:

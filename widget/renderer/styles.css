@@ -39,9 +39,9 @@ html, body {
 button { font: inherit; color: inherit; }
 
 /* The shell clips the shape while it morphs; its size is set by renderer.js and the window
-   follows it. Anchored at the top-right, so the corner the window is anchored by never moves. */
+   follows it. Centred horizontally, so the shape grows evenly from the middle of its top edge. */
 .shell {
-  position: absolute; top: var(--margin); right: var(--margin);
+  position: absolute; top: var(--margin); left: 0; right: 0; margin: 0 auto;
   width: 28px; height: 28px;
   border-radius: 14px;
   overflow: hidden;
@@ -51,10 +51,10 @@ button { font: inherit; color: inherit; }
 }
 .shell.instant { transition: opacity var(--t-hide) ease, transform var(--t-hide) var(--ease); }
 .shell.notrans { transition: none; }
-.shell.hidden { opacity: 0; transform: translateX(12px); }
+.shell.hidden { opacity: 0; transform: translateY(-12px); } /* hides upward, off the top */
 .shell.card-view { border-radius: 8px; }
 
-.inner { position: absolute; top: 0; right: 0; }
+.inner { position: absolute; top: 0; left: 50%; transform: translateX(-50%); }
 
 /* ---- Pill: rest, hover, listening, transcribing, working, success ------------------------- */
 .pill {
@@ -69,11 +69,13 @@ button { font: inherit; color: inherit; }
 }
 .shell:not(.card-view) .pill { display: inline-flex; }
 [data-view="rest"]:not(.hover) .pill, [data-view="success"] .pill { width: 28px; padding: 0; }
-/* On hover the mark stays exactly where the resting dot was: 7 px from the right edge. */
-[data-view="rest"].hover .pill { padding: 0 7px 0 8px; }
-[data-view="rest"].hover .chev { order: -3; }
-[data-view="rest"].hover .grip { order: -2; }
-[data-view="rest"].hover .line { order: -1; }
+/* On hover the pill widens evenly around the mark, so the dot stays where the resting dot was:
+   the grip on the left and the hide chevron on the right take 16 px each. */
+[data-view="rest"].hover .pill { padding: 0 6px; }
+[data-view="rest"].hover .grip { order: 1; }
+[data-view="rest"].hover .glyph { order: 2; }
+[data-view="rest"].hover .line { order: 3; }
+[data-view="rest"].hover .chev { order: 4; }
 [data-view="rest"] .pill { background: rgb(var(--surface) / var(--a-rest)); cursor: pointer; }
 [data-view="rest"][data-online="0"] .pill,
 [data-view="rest"][data-voice="off"] .pill,
@@ -112,7 +114,7 @@ button { font: inherit; color: inherit; }
 [data-view="rest"].hover .line:not(:empty) { display: block; color: var(--text-muted); font-size: 12px; }
 
 .grip, .chev { display: none; }
-[data-view="rest"].hover .grip { display: block; width: 6px; height: 12px; cursor: grab;
+[data-view="rest"].hover .grip { display: block; width: 6px; height: 12px; margin: 0 5px; cursor: grab;
   background-image: radial-gradient(circle, rgba(255, 255, 255, 0.6) 1px, transparent 1.2px);
   background-size: 3px 4px; }
 [data-view="rest"].hover .chev { display: block; width: 16px; height: 20px; padding: 0; border: none; border-radius: 4px;

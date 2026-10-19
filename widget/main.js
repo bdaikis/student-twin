@@ -1,7 +1,7 @@
 // Student Twin widget — main process.
 // Behaviour follows wiki/projects/student-twin/voice-widget-spec.md; the window and its look follow
 // the Ghost Overlay UI Redesign (2026-10-18): one window that fits its content, anchored at the
-// visible shape's top-right corner.
+// middle of the visible shape's top edge (top centre of the screen by default, since 2026-10-19).
 const { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, session } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -26,28 +26,27 @@ let sessionId = null; // X-Hermes-Session-Id: one conversation per widget run
 const inflight = new Map(); // request id -> AbortController
 
 // Geometry, in DIP. The renderer reports the visible shape's size; the window adds a transparent
-// margin on every side for the CSS shadow and is placed so the shape's top-right corner stays put.
+// margin on every side for the CSS shadow and is placed so the middle of the shape's top edge
+// stays put: shapes grow evenly left and right, and downward.
 const MARGIN = 10;
-const RIGHT_INSET = 20; // visible right edge, in from the work area's right edge
-const TOP_OFFSET = 100; // visible top edge, down from the work area's top
+const TOP_OFFSET = 12; // visible top edge, down from the work area's top
 const REST = 28; // the resting dot
-const REVEAL_ZONE_W = 360; // top-edge reveal stretch, fixed whatever the widget's size
+const REVEAL_ZONE_W = 360; // top-edge reveal stretch, centred on the default position
 const REVEAL_POLL_MS = 100;
 const REVEAL_DWELL_MS = 400;
 const HIDE_FADE_MS = 200; // renderer fade before the window moves offscreen
-const CAPTION_BUTTONS_DIP = 3 * 46; // minimise, maximise, close of a maximised window
 
 let win = null;
 let tray = null;
 let hidden = false;
-let anchor = null; // { right, top }: the visible shape's top-right corner when shown
+let anchor = null; // { cx, top }: the middle of the visible shape's top edge when shown
 let shape = { w: REST, h: REST }; // last size the renderer asked for
 let dwellStart = null;
 let hideTimer = null; // "Hide for 1 hour"
 
 function defaultAnchor() {
   const { workArea } = screen.getPrimaryDisplay();
-  return { right: workArea.x + workArea.width - RIGHT_INSET, top: workArea.y + TOP_OFFSET };
+  return { cx: workArea.x + workArea.width / 2, top: workArea.y + TOP_OFFSET };
 }
 
 // Window bounds for a shape of size w x h at the anchor, kept inside the anchor's work area. A
@@ -55,8 +54,8 @@ function defaultAnchor() {
 function boundsFor(w, h, at = anchor) {
   const width = Math.round(w) + 2 * MARGIN;
   const height = Math.round(h) + 2 * MARGIN;
-  const { workArea } = screen.getDisplayNearestPoint({ x: Math.round(at.right - 1), y: Math.round(at.top) });
-  let x = Math.round(at.right + MARGIN - width);
+  const { workArea } = screen.getDisplayNearestPoint({ x: Math.round(at.cx), y: Math.round(at.top) });
+  let x = Math.round(at.cx - width / 2);
   let y = Math.round(at.top - MARGIN);
   x = Math.max(workArea.x - MARGIN, Math.min(x, workArea.x + workArea.width + MARGIN - width));
   y = Math.max(workArea.y - MARGIN, Math.min(y, workArea.y + workArea.height + MARGIN - height));
@@ -66,9 +65,9 @@ function boundsFor(w, h, at = anchor) {
 function place(bounds) {
   win.setBounds(bounds); // one atomic call: separate move and resize calls flicker
   // Windows enforces a minimum window size (about 51 x 50 DIP at 150%) and grows a smaller window
-  // to the right; move it left by the excess so the shape's right edge stays on the anchor.
+  // to the right; move it left by half the excess so the shape stays centred on the anchor.
   const got = win.getBounds();
-  if (got.width > bounds.width + 1) win.setBounds({ ...got, x: bounds.x - (got.width - bounds.width) });
+  if (got.width > bounds.width + 1) win.setBounds({ ...got, x: Math.round(bounds.x - (got.width - bounds.width) / 2) });
 }
 
 function createWindow() {
@@ -115,9 +114,9 @@ function createWindow() {
 // A display change can leave the anchor off every screen; pull it back to the nearest work area.
 function reanchor() {
   if (!win) return;
-  const { workArea } = screen.getDisplayNearestPoint({ x: Math.round(anchor.right), y: Math.round(anchor.top) });
+  const { workArea } = screen.getDisplayNearestPoint({ x: Math.round(anchor.cx), y: Math.round(anchor.top) });
   anchor = {
-    right: Math.max(workArea.x + REST, Math.min(anchor.right, workArea.x + workArea.width)),
+    cx: Math.max(workArea.x + REST, Math.min(anchor.cx, workArea.x + workArea.width - REST)),
     top: Math.max(workArea.y, Math.min(anchor.top, workArea.y + workArea.height - REST)),
   };
   if (!hidden) place(boundsFor(shape.w, shape.h));
@@ -153,7 +152,7 @@ function drag(on) {
       if (p.x === last.x && p.y === last.y) return; // nothing moved, nothing to do
       last = p;
       win.setBounds({ x: b.x + p.x - start.x, y: b.y + p.y - start.y, width: b.width, height: b.height });
-      anchor = { right: startAnchor.right + p.x - start.x, top: startAnchor.top + p.y - start.y };
+      anchor = { cx: startAnchor.cx + p.x - start.x, top: startAnchor.top + p.y - start.y };
     }, 16);
   } else if (!on && dragging) {
     clearInterval(dragging);
@@ -162,7 +161,7 @@ function drag(on) {
     // bounds asked for, not read back from Windows.
     const nb = boundsFor(shape.w, shape.h);
     place(nb);
-    anchor = { right: nb.x + nb.width - MARGIN, top: nb.y + MARGIN };
+    anchor = { cx: nb.x + nb.width / 2, top: nb.y + MARGIN };
   }
 }
 
@@ -196,7 +195,7 @@ function hideWidget() {
     const b = win.getBounds();
     const display = screen.getDisplayMatching(b);
     win.setIgnoreMouseEvents(true);
-    place({ ...b, x: display.bounds.x + display.bounds.width + 50 });
+    place({ ...b, y: display.bounds.y - b.height - 50 }); // up, off the top of the screen
     updateTray();
   }, HIDE_FADE_MS + 20);
 }
@@ -220,9 +219,9 @@ function hideForAnHour() {
   hideTimer = setTimeout(() => { hideTimer = null; showWidget(); }, 60 * 60 * 1000);
 }
 
-// Top-edge reveal: a fixed stretch of the primary display's top edge above the widget's default
-// position (not wherever it was dragged), minus the caption-button corner, after a short dwell.
-// Polled, so no invisible strip window can swallow clicks on tabs or title bars.
+// Top-edge reveal: a fixed stretch of the primary display's top edge, centred on the widget's
+// default position (not wherever it was dragged), after a short dwell. Polled, so no invisible
+// strip window can swallow clicks on tabs or title bars.
 function isTopEdgeOfDesktop(display) {
   // With monitors stacked vertically, only the top display's top edge counts.
   return !screen.getAllDisplays().some((d) =>
@@ -236,9 +235,9 @@ function pollReveal() {
   if (!hidden || !win) { dwellStart = null; return; }
   const p = screen.getCursorScreenPoint();
   const display = screen.getPrimaryDisplay();
-  const right = display.bounds.x + display.bounds.width;
-  const zoneLeft = right - REVEAL_ZONE_W;
-  const zoneRight = right - CAPTION_BUTTONS_DIP;
+  const cx = defaultAnchor().cx;
+  const zoneLeft = cx - REVEAL_ZONE_W / 2;
+  const zoneRight = cx + REVEAL_ZONE_W / 2;
   const inZone = p.y <= display.bounds.y + 1 && p.x >= zoneLeft && p.x < zoneRight && isTopEdgeOfDesktop(display);
   // TODO(2e): suppress while a full-screen app is in front (SHQueryUserNotificationState).
   if (!inZone) { dwellStart = null; return; }

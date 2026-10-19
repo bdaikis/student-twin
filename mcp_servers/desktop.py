@@ -56,6 +56,26 @@ user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
 
 BROWSERS = ("chrome.exe", "msedge.exe", "brave.exe", "firefox.exe", "opera.exe", "vivaldi.exe")
 
+# Programs whose windows usually hold Bhanu's work: documents, code, other tabs, a terminal session.
+# The twin closes one of these only if it opened that window itself, or when he names its exact title.
+WORK_APPS = set(BROWSERS) | {
+    "notepad.exe", "notepad++.exe", "code.exe", "cursor.exe", "sublime_text.exe", "devenv.exe",
+    "pycharm64.exe", "idea64.exe", "winword.exe", "excel.exe", "powerpnt.exe", "onenote.exe",
+    "acrobat.exe", "acrord32.exe", "obsidian.exe", "windowsterminal.exe", "cmd.exe", "powershell.exe",
+    "wt.exe", "matlab.exe", "jupyter-lab.exe",
+}
+
+# Windows the twin opened while this server runs: hwnd -> {"kind": "window" or "tab", "title", "at"}.
+# "window": a new window it opened. "tab": a page it opened as a new tab in a window that was
+# already open, so closing it must close that tab only.
+_OPENED: dict[int, dict] = {}
+
+
+def _remember_opened(hwnd, kind: str, title: str) -> None:
+    for h in [h for h in _OPENED if not user32.IsWindow(h)]:
+        del _OPENED[h]
+    _OPENED[hwnd] = {"kind": kind, "title": title, "at": time.time()}
+
 
 # --- Opening things ---------------------------------------------------------------------------
 def _default_browser_exe() -> str | None:
@@ -108,6 +128,7 @@ def _open_web(url: str) -> str:
     # later commands (arrange, maximize, close tab) can find the window by the page's name.
     title = _wait_for(lambda: (lambda t: t if t and not _loading_title(t, url) else None)(_window_title(win["hwnd"])), 8)
     title = title or _window_title(win["hwnd"])
+    _remember_opened(win["hwnd"], "window" if win["hwnd"] not in before else "tab", title)
     return (f"Opened {url} in {where}" + ("" if focused else ", but Windows didn't let me bring it to the front")
             + f". Its window is titled {title!r}.")
 
@@ -230,6 +251,8 @@ def open_app(name: str) -> str:
         # which case its existing window is brought forward instead.
         win = _wait_for(lambda: next((w for w in _find_windows(app["Name"]) if w["hwnd"] not in before), None),
                         2 if already_open else 10)
+        if win is not None:
+            _remember_opened(win["hwnd"], "window", win["title"])  # a window this call created
         win = win or next(iter(_find_windows(app["Name"])), None)
         if win is None:
             return f"Opened {app['Name']}; its window hasn't appeared yet."
@@ -467,7 +490,11 @@ def window(name: str, action: str = "focus") -> str:
     ("Minecraft", "VS Code", "PyTorch", "Spotify"). `action`: focus (bring to the front), maximize,
     minimize, restore, close (asks the program to close, as its X button does, so it can still
     offer to save work), or close_tab (closes one browser tab and leaves the window's other tabs open;
-    `name` is part of the tab's page title, and it works on the tab showing in front of its window)."""
+    `name` is part of the tab's page title, and it works on the tab showing in front of its window).
+    Closing prefers a window you opened for Bhanu; a page you opened as a tab in his existing window
+    closes as that tab only. A browser, editor, document or terminal window you didn't open is not
+    closed: the result asks which one, and you close it only after he says so, by passing its exact
+    full title. Never close on a guess from an unclear command (a single word like "off")."""
     act = action.strip().lower().replace(" ", "_")
     if act not in ("focus", "maximize", "minimize", "restore", "close", "close_tab"):
         return "Unknown action; use focus, maximize, minimize, restore, close or close_tab."
@@ -478,10 +505,7 @@ def window(name: str, action: str = "focus") -> str:
         return f"Couldn't find a window for {name!r}. Use list_windows to see what's open."
     win = hits[0]
     if act == "close":
-        if len(hits) > 1:
-            return "Several windows match; say which to close: " + "; ".join(w["title"] for w in hits[:8]) + "."
-        user32.PostMessageW(win["hwnd"], 0x0010, 0, 0)  # WM_CLOSE
-        return f"Asked {win['title']} to close."
+        return _close(name, hits)
     if act == "minimize":
         user32.ShowWindow(win["hwnd"], 6)  # SW_MINIMIZE
         return f"Minimized {win['title']}."
@@ -490,6 +514,38 @@ def window(name: str, action: str = "focus") -> str:
     focused = _focus(win["hwnd"])
     done = {"focus": "Brought {} to the front", "maximize": "Maximized {}", "restore": "Restored {}"}[act]
     return done.format(win["title"]) + ("." if focused else ", but Windows didn't let me bring it to the front.")
+
+
+def _post_close(win: dict) -> str:
+    user32.PostMessageW(win["hwnd"], 0x0010, 0, 0)  # WM_CLOSE, as the X button does
+    _OPENED.pop(win["hwnd"], None)
+    return f"Asked {win['title']} to close."
+
+
+def _close(name: str, hits: list[dict]) -> str:
+    """Close the window `name` refers to, without closing Bhanu's own work by mistake (on
+    2026-10-15 "close Notepad" closed a Notepad window holding another file of his)."""
+    mine = [w for w in hits if _OPENED.get(w["hwnd"], {}).get("kind") == "window"]
+    if mine:  # a window the twin opened: the newest one
+        return _post_close(max(mine, key=lambda w: _OPENED[w["hwnd"]]["at"]))
+    for w in hits:
+        rec = _OPENED.get(w["hwnd"])
+        # A page the twin opened as a tab in his window, still the tab in front: close that tab only.
+        if rec and rec["kind"] == "tab" and _norm(rec["title"]) == _norm(w["title"]):
+            if not _focus(w["hwnd"]) or user32.GetForegroundWindow() != w["hwnd"]:
+                return f"Windows didn't let me bring {w['title']} to the front, so nothing was closed."
+            _press_ctrl(0x57)  # Ctrl+W
+            _OPENED.pop(w["hwnd"], None)
+            return f"Closed the tab {w['title']} that I opened; the window's other tabs stay open."
+    exact = [w for w in hits if _norm(w["title"]) == _norm(name)]
+    if len(exact) == 1:  # he named the window by its full title: that is his go-ahead
+        return _post_close(exact[0])
+    if len(hits) == 1 and hits[0]["process"].lower() not in WORK_APPS:
+        return _post_close(hits[0])
+    listed = "; ".join(f"{w['title']} [{w['process']}]" for w in hits[:8])
+    return ("Not closed: I didn't open " + ("these windows" if len(hits) > 1 else "this window")
+            + f" and it may hold Bhanu's work ({listed}). Ask him which to close; then call window "
+            "again with that window's exact full title.")
 
 
 def _close_tab(name: str) -> str:

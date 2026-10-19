@@ -4,6 +4,7 @@ Run by the widget with Hermes's Python (so faster-whisper comes from Hermes's ow
 Protocol: JSON lines. Commands on stdin, events on stdout.
 
   events:   {"event": "ready"} | {"event": "press"} | {"event": "hold"} | {"event": "release"}
+            {"event": "fullscreen", "busy": true|false} (a full-screen app is in front, or not)
             {"event": "tap"} | {"event": "transcript", "id", "ok", "text", "error", "ms"}
             {"event": "log", "message"}
   commands: {"cmd": "transcribe", "id": "...", "path": "C:/...wav"} | {"cmd": "restore_focus"}
@@ -258,6 +259,25 @@ def restore_focus():
     user32.SetForegroundWindow(hwnd)
 
 
+# --- Full-screen detection, so the widget's top-edge reveal stays out of games and videos --------
+# Windows sends no event when a full-screen app starts, so ask once a second and report changes.
+# QUNS_BUSY (2), QUNS_RUNNING_D3D_FULL_SCREEN (3), QUNS_PRESENTATION_MODE (4), QUNS_APP (7: a Store
+# app full screen) mean something full screen is in front.
+FULLSCREEN_STATES = {2, 3, 4, 7}
+
+
+def run_fullscreen_watch():
+    shell32 = ctypes.WinDLL("shell32")
+    state = ctypes.c_int()
+    last = None
+    while True:
+        busy = shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0 and state.value in FULLSCREEN_STATES
+        if busy != last:
+            emit(event="fullscreen", busy=busy)
+            last = busy
+        time.sleep(1)
+
+
 # --- Transcription (Hermes's own faster-whisper path) -----------------------------------------
 def transcribe(path):
     from tools.transcription_tools import transcribe_audio  # imported lazily: heavy
@@ -323,6 +343,7 @@ def main():
     if "--no-hook" not in sys.argv:
         threading.Thread(target=run_hook, daemon=True).start()
     threading.Thread(target=run_focus_tracker, daemon=True).start()
+    threading.Thread(target=run_fullscreen_watch, daemon=True).start()
     emit(event="ready")
     warm_up()
     threading.Thread(target=run_transcriber, daemon=True).start()

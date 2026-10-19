@@ -42,6 +42,7 @@ let hidden = false;
 let anchor = null; // { cx, top }: the middle of the visible shape's top edge when shown
 let shape = { w: REST, h: REST }; // last size the renderer asked for
 let dwellStart = null;
+let fullscreenBusy = false; // reported by the voice helper (SHQueryUserNotificationState)
 let hideTimer = null; // "Hide for 1 hour"
 
 function defaultAnchor() {
@@ -239,8 +240,8 @@ function pollReveal() {
   const zoneLeft = cx - REVEAL_ZONE_W / 2;
   const zoneRight = cx + REVEAL_ZONE_W / 2;
   const inZone = p.y <= display.bounds.y + 1 && p.x >= zoneLeft && p.x < zoneRight && isTopEdgeOfDesktop(display);
-  // TODO(2e): suppress while a full-screen app is in front (SHQueryUserNotificationState).
-  if (!inZone) { dwellStart = null; return; }
+  // While a game, a full-screen video or a presentation is in front, the edge belongs to it.
+  if (!inZone || fullscreenBusy) { dwellStart = null; return; }
   if (dwellStart === null) dwellStart = Date.now();
   if (Date.now() - dwellStart >= REVEAL_DWELL_MS) { dwellStart = null; showWidget(); }
 }
@@ -278,6 +279,7 @@ const WIDGET_RULES = [
   "Prefer the desktop tools over screen control. Use the weather tool for weather, rain and air quality, and web search for other facts. For anything posted in a course use course_materials and open_course_item; for attendance totals use attendance, and for whether he has been marked today use attendance_today; for his classes on a day use timetable_day. When he says he is in class (\"here\", \"check me in\"), call mark_attendance. To create a text file use write_text_file.",
   'To see or act inside an open window (a page in Chrome, a list in File Explorer, a button in an app), use ui_read first, then ui_click or ui_type by the element names it returns. Use web_extract only for pages that are not open on screen.',
   'When a window or app name matches nothing, check list_windows and ask whether he meant the closest-sounding one, naming it.',
+  'Never close anything on a guess: if a close command is unclear (for example a single word such as "off"), ask what to close. When the window tool says it did not close a window of his, ask him, and only then close it by its exact full title.',
   "Irreversible tools such as delete_files show him a confirm card themselves and wait for his click: call them directly, without asking for confirmation in chat, and never retry one he cancelled. When he cancels the card or it times out, reply with only ${DONE_MARK}: the card already shows the outcome. Never claim something was deleted unless the tool result says so.",
 ].join(' ');
 
@@ -372,6 +374,7 @@ function startHelper() {
       case 'hold': showWidget(); toRenderer('mic', 'start'); break;
       case 'release': toRenderer('mic', 'stop'); break;
       case 'tap': toRenderer('mic', 'discard'); break;
+      case 'fullscreen': fullscreenBusy = Boolean(ev.busy); break;
       case 'transcript': {
         const file = pendingAudio.get(ev.id);
         pendingAudio.delete(ev.id);

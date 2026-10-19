@@ -188,14 +188,22 @@ def _session_ids(page: dict) -> list[int]:
 
 
 def _statuses(html: str) -> list[tuple[int, str]]:
-    """(status id, label) pairs offered on the check-in form."""
-    out = []
-    for chunk in re.split(r"<ion-item\b", html):
-        ids = re.findall(r"value=\"(\d+)\"", chunk)
-        label = " ".join(re.sub(r"<[^>]+>|\{\{.*?\}\}", " ", chunk).split())
-        if len(ids) == 1 and label:
-            out.append((int(ids[0]), label[:60]))
-    return out
+    """(status id, label) pairs offered on the check-in form: <ion-radio value="ID">Label</ion-radio>."""
+    return [(int(v), " ".join(re.sub(r"<[^>]+>", " ", label).split())[:60])
+            for v, label in re.findall(r"<ion-radio\b[^>]*\bvalue=\"(\d+)\"[^>]*>(.*?)</ion-radio>", html, re.S)]
+
+
+def _form_messages(html: str) -> list[str]:
+    """The plugin's message keys shown on a page ('subnetwrong', 'invalidstatus', ...)."""
+    return re.findall(r"<span class=\"messages\">.*?plugin\.mod_attendance\.(\w+)", html, re.S)
+
+
+_MESSAGES = {
+    "subnetwrong": "SPeCTRUM only accepts this check-in from the university network",
+    "incorrectpasswordshort": "the session needs a password from the lecturer",
+    "attendance_no_status": "no status is available to choose right now",
+    "invalidstatus": "SPeCTRUM refused the status (the check-in window may have closed)",
+}
 
 
 def _log(entry: dict) -> None:
@@ -247,12 +255,17 @@ def mark_attendance(course: str = "") -> str:
             view = moodle().attendance_view(cid, act["cmid"], fresh=True)
             snapshots.append(_snapshot(code, "view", view))
             for sessid in _session_ids(view):
-                form = moodle().attendance_view(cid, act["cmid"], sessid=sessid)
+                # The app's "Submit attendance" button opens this form; submitting the chosen status
+                # goes back through the view (mod_attendance classes/output/mobile.php).
+                form = moodle().attendance_form(cid, act["cmid"], sessid)
                 snapshots.append(_snapshot(code, f"form-{sessid}", form))
                 options = _statuses(form["html"])
+                notes = [_MESSAGES.get(m, m) for m in _form_messages(form["html"])]
+                if 'name="studentpass"' in form["html"]:
+                    notes.append(_MESSAGES["incorrectpasswordshort"])
                 present = [sid for sid, label in options if PRESENT.search(label)]
                 result = form
-                if present:
+                if present and 'name="studentpass"' not in form["html"]:
                     result = moodle().attendance_view(cid, act["cmid"], sessid=sessid, status=present[0])
                     snapshots.append(_snapshot(code, f"result-{sessid}", result))
                 after = next((dict(a["rows"]) for a in moodle().attendance(cid, fresh=True)
@@ -265,7 +278,8 @@ def mark_attendance(course: str = "") -> str:
                 if changed:
                     return (f"Checked in on SPeCTRUM for {code} {info['name']} ({block.start:%H:%M}–{block.end:%H:%M}): "
                             f"now {_summary(after)}. Sign the paper sheet too.")
-                tried.append(f"session {sessid} (status options: {', '.join(l for _, l in options) or 'none found'})")
+                tried.append(f"session {sessid} (status options: {', '.join(l for _, l in options) or 'none'}"
+                             + (f"; {'; '.join(notes)}" if notes else "") + ")")
         if not tried:
             return (f"SPeCTRUM shows no open check-in for {code} right now; the lecturer may not have opened it "
                     f"yet. Try again in a few minutes. (Saved the page for Claude Code: {snapshots[-1]})")

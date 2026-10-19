@@ -26,14 +26,20 @@ def _guard(function: str, params: dict, marking: bool) -> None:
     """Extra limits on general-purpose calls. tool_mobile_get_content runs any plugin's mobile
     method; the attendance plugin's view also *records* attendance when given a session id (and a
     status). Reads may pass only cmid, courseid and userid. Marking (Bhanu's own check-in, on his
-    request while his class runs) may add sessid, status and studentpass, and only through
-    Moodle.attendance_view(..., sessid=...)."""
+    request while his class runs) may add sessid, status and studentpass through
+    Moodle.attendance_view(..., sessid=...), and may fetch the check-in form (mobile_user_form,
+    which only renders the statuses he may choose) through Moodle.attendance_form."""
     if function != "tool_mobile_get_content":
         return
     names = {v for k, v in params.items() if k.startswith("args[") and k.endswith("[name]")}
-    allowed = {"cmid", "courseid", "userid"} | ({"sessid", "status", "studentpass"} if marking else set())
-    if (params.get("component") != "mod_attendance" or params.get("method") != "mobile_view_activity"
-            or not names <= allowed):
+    method = params.get("method")
+    if method == "mobile_view_activity":
+        allowed = {"cmid", "courseid", "userid"} | ({"sessid", "status", "studentpass"} if marking else set())
+    elif method == "mobile_user_form" and marking:
+        allowed = {"cmid", "courseid", "sessid", "appversioncode"}
+    else:
+        allowed = None
+    if params.get("component") != "mod_attendance" or allowed is None or not names <= allowed:
         raise MoodleError("only the attendance plugin's view (and Bhanu's own check-in) is allowed through tool_mobile_get_content")
 
 
@@ -169,6 +175,22 @@ class Moodle:
                 out.append({"name": mod.get("name", "Attendance").strip(), "cmid": mod["id"], "rows": rows,
                             "sessions": _sessions(page)})
         return out
+
+    def attendance_form(self, course_id: int, cmid: int, sessid: int) -> dict:
+        """The check-in form for one session, as the app's "Submit attendance" button opens it
+        (mobile_user_form): the statuses Bhanu may choose, or a message (password needed, wrong
+        network, check-in closed). It records nothing; only mark_attendance calls it."""
+        args = [("cmid", cmid), ("courseid", course_id), ("sessid", sessid),
+                ("appversioncode", 44000)]  # the plugin picks its current form template from 44000 up
+        params = {}
+        for i, (name, value) in enumerate(args):
+            params[f"args[{i}][name]"] = name
+            params[f"args[{i}][value]"] = value
+        data = self.call("tool_mobile_get_content", _marking=True, component="mod_attendance",
+                         method="mobile_user_form", **params)
+        return {"html": "".join(t.get("html", "") for t in data.get("templates", [])),
+                "javascript": data.get("javascript") or "",
+                "otherdata": json.dumps(data.get("otherdata") or [])}
 
     def attendance_view(self, course_id: int, cmid: int, sessid: int | None = None,
                         status: int | None = None, fresh: bool = False) -> dict:

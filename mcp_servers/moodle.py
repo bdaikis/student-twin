@@ -19,6 +19,12 @@ READ_ONLY = {
     "core_enrol_get_users_courses",
     "core_course_get_contents",
     "tool_mobile_get_content",  # guarded below: only the attendance plugin's read-only view
+    # Deadlines (slice 3): the dashboard timeline, assignments and quizzes with his own status.
+    "core_calendar_get_action_events_by_timesort",
+    "mod_assign_get_assignments",
+    "mod_assign_get_submission_status",
+    "mod_quiz_get_quizzes_by_courses",
+    "mod_quiz_get_user_attempts",
 }
 
 

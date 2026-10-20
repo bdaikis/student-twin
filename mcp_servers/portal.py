@@ -17,6 +17,7 @@ from datetime import timedelta
 
 from mcp.server.mcpserver import MCPServer
 
+import deadlines as dl
 import timetable
 from common import (DATA, PRESENT, course_contents, course_id, match_course, moodle, remember_sessions,
                     remembered_session, session_for, totals_verdict)
@@ -71,6 +72,57 @@ def now() -> str:
     elif not running:
         lines.append("No more classes in the timetable.")
     return " ".join(lines)
+
+
+@server.tool()
+def deadlines(days: int = 7, course: str = "") -> str:
+    """What Bhanu has to hand in or sit: anything overdue that he hasn't submitted, then everything due
+    in the next `days` days (default 7), soonest first. Covers SPeCTRUM (assignments with his submission
+    status, quizzes with his attempts, other due items), tests and dates from the course-information
+    forms, and deadlines he added himself. `course` narrows it to one course. Use it for "what's due
+    this week", "what's overdue", "anything for SIF1006", and "when is X due" (pass days=150 so later
+    items are included). Always check here before saying something is or isn't due."""
+    note = ""
+    try:
+        dl.refresh()
+    except Exception as exc:
+        note = f"\n(Couldn't refresh from SPeCTRUM: {exc}. This is what was read last time.)"
+    now = timetable.now()
+    ts = int(now.timestamp())
+    rows = dl.upcoming(max(1, min(int(days), 200)), course)
+    # Overdue means something he can still hand in: assignments and quizzes SPeCTRUM shows as not done.
+    # A forum due date passes without SPeCTRUM saying whether he posted; a past test simply happened.
+    overdue = [r for r in rows if r["due"] < ts and r["kind"] in ("assignment", "quiz") and r["status"] not in dl.DONE]
+    unknown = [r for r in rows if r["due"] < ts and r["kind"] in ("forum", "other") and r["due"] > ts - 7 * 86400]
+    soon = [r for r in rows if r["due"] >= ts]
+    scope = f" for {course}" if course.strip() else ""
+    parts = [f"As of {now:%a %d %b %H:%M}{scope}:"]
+    if overdue:
+        parts.append("Overdue and not submitted:\n" + "\n".join(f"- {dl.line(r, now)}" for r in overdue))
+    if unknown:
+        parts.append("Past due in the last week; SPeCTRUM doesn't show whether these were done:\n" + "\n".join(
+            f"- {dl.line(r, now)}" for r in unknown))
+    if soon:
+        parts.append(f"Due in the next {days} days:\n" + "\n".join(f"- {dl.line(r, now)}" for r in soon))
+    if not overdue and not soon:
+        parts.append(f"Nothing due in the next {days} days, and nothing overdue.")
+    return "\n".join(parts) + note
+
+
+@server.tool()
+def add_deadline(course: str, title: str, when: str, note: str = "") -> str:
+    """Add a deadline or test Bhanu tells you about that SPeCTRUM doesn't list, e.g. course "SIF1014",
+    title "Test 1", when "Tue 27 Oct" (or "27 Oct 9am", "next Monday", "week 8"). With no time, his
+    class time that day is used if he has one, otherwise the end of the day. Adding the same title
+    again updates its date. Only when he asks."""
+    return dl.add(course, title, when, note)
+
+
+@server.tool()
+def remove_deadline(course: str, title: str) -> str:
+    """Remove a deadline Bhanu added himself (or one taken from a course form), by course and title.
+    Deadlines from SPeCTRUM can't be removed. Only when he asks."""
+    return dl.remove(course, title)
 
 
 @server.tool()

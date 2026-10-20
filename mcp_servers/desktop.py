@@ -671,6 +671,8 @@ _KNOWN_FOLDERS = {  # Windows known-folder IDs, so redirected folders (e.g. to O
     "music": "{4BD8D571-6D19-48D3-BE97-422220080E43}",
 }
 _MAX_DELETE = 500
+_SHORT_SEARCH_S = 5.0  # a recursive search stops here and the twin asks whether to go on
+_LONG_SEARCH_S = 120.0  # when he says to keep searching (Hermes allows an MCP call 300 s)
 
 
 def _known_folder(guid: str) -> Path | None:
@@ -806,16 +808,22 @@ def _size(n: float) -> str:
 
 
 @server.tool()
-def list_files(folder: str, pattern: str = "*", recursive: bool = False) -> str:
+def list_files(folder: str, pattern: str = "*", recursive: bool = False, keep_searching: bool = False) -> str:
     """List files in a folder, newest first, with sizes and dates. `folder` is Downloads, Desktop,
     Documents, Pictures, Videos, Music, a path inside Bhanu's user folder, or a folder's name as he
     says it ("the twin test folder" finds Downloads\\twin-test). `pattern` is a wildcard such as
-    "*.zip" or "Screenshot*". Read-only. Recursive searches stop after 5 seconds."""
+    "*.zip" or "Screenshot*". Read-only. A recursive search stops after 5 seconds; if it does, ask
+    Bhanu whether to keep searching, and only if he says yes call again with keep_searching=True
+    (up to 2 minutes)."""
     path = _resolve_folder(folder)
     if isinstance(path, str):
         return path
-    files, complete = _matches(path, pattern, recursive, None)
-    stopped = "" if complete else " (the search stopped after 5 seconds; there may be more)"
+    limit = _LONG_SEARCH_S if keep_searching else _SHORT_SEARCH_S
+    files, complete = _matches(path, pattern, recursive, None, limit)
+    stopped = "" if complete else (
+        f" (the search stopped after {limit:.0f} seconds and may have missed some. Ask Bhanu whether to keep "
+        "searching; if he says yes, call list_files again with keep_searching=true)" if not keep_searching
+        else f" (the longer search also stopped, after {limit:.0f} seconds; suggest a narrower folder)")
     if not files:
         return f"No files in {path} match {pattern!r}{stopped}."
     lines = [f"- {f.relative_to(path)} ({_size(f.stat().st_size)}, "
@@ -840,7 +848,7 @@ def _recycle(paths: list[Path]) -> int:
 
 @server.tool()
 async def delete_files(folder: str, pattern: str, recursive: bool = False,
-                       older_than_days: float | None = None) -> str:
+                       older_than_days: float | None = None, keep_searching: bool = False) -> str:
     """Move files to the Recycle Bin, after Bhanu confirms on the widget's confirm card. The tool
     shows the card itself and waits up to 60 s: never ask him to confirm in chat first, and don't
     retry after a cancel. `folder` as in list_files; `pattern` a wildcard ("*.zip", "*" for every
@@ -850,9 +858,13 @@ async def delete_files(folder: str, pattern: str, recursive: bool = False,
         return path
     if not pattern.strip():
         return "Give a pattern, e.g. \"*.zip\", or \"*\" for every file in the folder."
-    files, complete = _matches(path, pattern, recursive, older_than_days)
+    limit = _LONG_SEARCH_S if keep_searching else _SHORT_SEARCH_S
+    files, complete = _matches(path, pattern, recursive, older_than_days, limit)
     if not complete:
-        return f"Finding the files in {path} took too long, so nothing was deleted. Narrow the folder or pattern."
+        if keep_searching:
+            return f"Finding the files in {path} took over {limit:.0f} seconds, so nothing was deleted. Narrow the folder or pattern."
+        return (f"Finding the files in {path} took over {limit:.0f} seconds, so nothing was deleted. Ask Bhanu whether to "
+                "keep searching; if he says yes, call delete_files again with keep_searching=true.")
     if not files:
         return f"No files in {path} match {pattern!r}; nothing to delete."
     if len(files) > _MAX_DELETE:

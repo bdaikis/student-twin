@@ -695,15 +695,71 @@ def _protected() -> list[Path]:
                                            for p in _config().get("protected_folders", [])]
 
 
+_SEARCH_ROOTS = ("downloads", "desktop", "documents", "pictures", "videos", "music")
+
+
+def _folder_key(name: str) -> str:
+    """"Twin Test folder", "twin-test" and "TwinTest" all give "twintest"."""
+    key = re.sub(r"(?i)\s+folder$", "", name.strip())
+    return re.sub(r"[^a-z0-9]+", "", key.lower())
+
+
+def _find_named_folder(name: str, under: list[Path] | None = None) -> list[Path]:
+    """Folders up to two levels inside the usual places (Downloads, Desktop, Documents, Pictures,
+    Videos, Music, OneDrive) whose name matches `name` ignoring case, spaces, hyphens and a
+    trailing "folder". Spoken names rarely match the real one exactly (on 20 Oct 2026 "the Twin Test
+    folder" was Downloads\\twin-test, and the twin searched the whole user folder for 30 s)."""
+    key = _folder_key(name)
+    if not key:
+        return []
+    roots = under or [r for r in (_known_folder(_KNOWN_FOLDERS[k]) for k in _SEARCH_ROOTS) if r] + \
+        sorted(Path.home().glob("OneDrive*"))
+    protected = _protected()
+    found = []
+    for root in roots:
+        level = [root]
+        for _ in range(2):
+            nxt = []
+            for d in level:
+                try:
+                    for child in d.iterdir():
+                        if child.is_dir() and not child.name.startswith(".") and \
+                                not any(child.resolve().is_relative_to(p) for p in protected):
+                            if _folder_key(child.name) == key and child.resolve() not in found:
+                                found.append(child.resolve())
+                            nxt.append(child)
+                except OSError:
+                    continue
+            level = nxt
+    return found
+
+
 def _resolve_folder(folder: str) -> Path | str:
-    """The folder as a resolved path inside Bhanu's user folder, or a refusal sentence."""
+    """The folder as a resolved path inside Bhanu's user folder, or a refusal sentence. Besides the
+    known folders and paths, a spoken folder name ("the Twin Test folder") is looked up by
+    _find_named_folder; "Downloads/Twin Test" matches its last part inside Downloads."""
     name = folder.strip().strip('"')
+    if name.lower().startswith("the "):
+        name = name[4:]
     guid = _KNOWN_FOLDERS.get(name.lower().removeprefix("my ").strip())
     path = _known_folder(guid) if guid else Path(os.path.expandvars(name)).expanduser()
     if path is None:
         return f"Couldn't find the {name} folder."
     if not path.is_absolute():
-        path = Path.home() / path
+        parts = Path(name).parts
+        head = _KNOWN_FOLDERS.get(parts[0].lower()) if len(parts) > 1 else None
+        path = (_known_folder(head) / Path(*parts[1:])) if head else Path.home() / path
+    if not path.is_dir():
+        if len(Path(name).parts) == 1 and not guid:
+            hits = _find_named_folder(name)
+        elif path.parent.is_dir():
+            hits = _find_named_folder(path.name, [path.parent])
+        else:
+            hits = []
+        if len(hits) == 1:
+            path = hits[0]
+        elif len(hits) > 1:
+            return f"Several folders are called that: {'; '.join(str(h) for h in hits[:8])}. Say which."
     path = path.resolve()
     home = Path.home().resolve()
     if not path.is_relative_to(home):
@@ -718,12 +774,18 @@ def _resolve_folder(folder: str) -> Path | str:
     return path
 
 
-def _matches(folder: Path, pattern: str, recursive: bool, older_than_days: float | None) -> list[Path]:
+def _matches(folder: Path, pattern: str, recursive: bool, older_than_days: float | None,
+             time_limit: float = 5.0) -> tuple[list[Path], bool]:
+    """(matching files, whether the search finished). A recursive search stops after `time_limit`
+    seconds: on 20 Oct 2026 one over the whole user folder ran for 30 s before Bhanu stopped it."""
     files = (folder.rglob if recursive else folder.glob)(pattern or "*")
     cutoff = time.time() - older_than_days * 86400 if older_than_days else None
     protected = _protected()
+    deadline = time.time() + time_limit
     out = []
     for f in files:
+        if time.time() > deadline:
+            return sorted(out, key=lambda f: f.stat().st_mtime, reverse=True), False
         try:
             # A folder may contain protected or hidden ones (Desktop holds the OneDrive vault): skip them.
             inside = f.relative_to(folder).parts[:-1]
@@ -733,7 +795,7 @@ def _matches(folder: Path, pattern: str, recursive: bool, older_than_days: float
                 out.append(f)
         except OSError:
             pass
-    return sorted(out, key=lambda f: f.stat().st_mtime, reverse=True)
+    return sorted(out, key=lambda f: f.stat().st_mtime, reverse=True), True
 
 
 def _size(n: float) -> str:
@@ -746,18 +808,20 @@ def _size(n: float) -> str:
 @server.tool()
 def list_files(folder: str, pattern: str = "*", recursive: bool = False) -> str:
     """List files in a folder, newest first, with sizes and dates. `folder` is Downloads, Desktop,
-    Documents, Pictures, Videos, Music, or a path inside Bhanu's user folder. `pattern` is a
-    wildcard such as "*.zip" or "Screenshot*". Read-only."""
+    Documents, Pictures, Videos, Music, a path inside Bhanu's user folder, or a folder's name as he
+    says it ("the twin test folder" finds Downloads\\twin-test). `pattern` is a wildcard such as
+    "*.zip" or "Screenshot*". Read-only. Recursive searches stop after 5 seconds."""
     path = _resolve_folder(folder)
     if isinstance(path, str):
         return path
-    files = _matches(path, pattern, recursive, None)
+    files, complete = _matches(path, pattern, recursive, None)
+    stopped = "" if complete else " (the search stopped after 5 seconds; there may be more)"
     if not files:
-        return f"No files in {path} match {pattern!r}."
+        return f"No files in {path} match {pattern!r}{stopped}."
     lines = [f"- {f.relative_to(path)} ({_size(f.stat().st_size)}, "
              f"{time.strftime('%d %b %Y %H:%M', time.localtime(f.stat().st_mtime))})" for f in files[:40]]
     more = f"\n…and {len(files) - 40} more." if len(files) > 40 else ""
-    return f"{len(files)} file(s) in {path} matching {pattern!r}:\n" + "\n".join(lines) + more
+    return f"{len(files)} file(s) in {path} matching {pattern!r}{stopped}:\n" + "\n".join(lines) + more
 
 
 def _recycle(paths: list[Path]) -> int:
@@ -786,7 +850,9 @@ async def delete_files(folder: str, pattern: str, recursive: bool = False,
         return path
     if not pattern.strip():
         return "Give a pattern, e.g. \"*.zip\", or \"*\" for every file in the folder."
-    files = _matches(path, pattern, recursive, older_than_days)
+    files, complete = _matches(path, pattern, recursive, older_than_days)
+    if not complete:
+        return f"Finding the files in {path} took too long, so nothing was deleted. Narrow the folder or pattern."
     if not files:
         return f"No files in {path} match {pattern!r}; nothing to delete."
     if len(files) > _MAX_DELETE:

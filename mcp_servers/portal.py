@@ -106,6 +106,12 @@ def deadlines(days: int = 7, course: str = "") -> str:
         parts.append(f"Due in the next {days} days:\n" + "\n".join(f"- {dl.line(r, now)}" for r in soon))
     if not overdue and not soon:
         parts.append(f"Nothing due in the next {days} days, and nothing overdue.")
+    # Always show what lies beyond the window, briefly: a question about a later item ("when is
+    # Project 2 due?") must not get "not found" because the window was a week (eval, 20 Oct 2026).
+    shown = {r["key"] for r in rows}
+    later = [r for r in dl.upcoming(200, course) if r["due"] >= ts and r["key"] not in shown]
+    if later:
+        parts.append("Later this semester:\n" + "\n".join(f"- {dl.line(r, now)}" for r in later))
     return "\n".join(parts) + note
 
 

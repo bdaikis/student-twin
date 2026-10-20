@@ -125,6 +125,14 @@ def add_deadline(course: str, title: str, when: str, note: str = "") -> str:
 
 
 @server.tool()
+def dismiss_deadline(course: str, title: str, when: str = "", restore: bool = False) -> str:
+    """Hide a deadline Bhanu says doesn't matter (e.g. it carries no marks), so it no longer appears in
+    what's due, the digests or the reminders. `when` (its due date) picks between items with the
+    same title; `restore=True` brings it back. Only when he asks."""
+    return dl.dismiss(course, title, when, restore)
+
+
+@server.tool()
 def remove_deadline(course: str, title: str) -> str:
     """Remove a deadline Bhanu added himself (or one taken from a course form), by course and title.
     Deadlines from SPeCTRUM can't be removed. Only when he asks."""

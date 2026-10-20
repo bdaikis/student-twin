@@ -48,6 +48,7 @@ def _connect() -> sqlite3.Connection:
             key TEXT NOT NULL, at INTEGER NOT NULL, change TEXT NOT NULL, old TEXT, new TEXT
         );
         CREATE TABLE IF NOT EXISTS meta (name TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS dismissed (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
     """)
     return db
 
@@ -271,6 +272,40 @@ def remove(course: str, title: str) -> str:
         db.close()
 
 
+def dismiss(course: str, title: str, when: str = "", restore: bool = False) -> str:
+    """Hide a deadline he says doesn't matter (or bring one back): it leaves "what's due", the
+    digests and the reminders. `when` picks between items with the same title."""
+    match = match_course(course)
+    if isinstance(match, str):
+        return match
+    code = match[0]
+    want = set(_slug(title).split("-")) - {""}
+    db = _connect()
+    try:
+        rows = [r for r in db.execute("SELECT key, title, due, precision FROM items WHERE course=?", (code,))
+                if want <= set(_slug(r["title"]).split("-"))]
+        if when and len(rows) > 1:
+            parsed = parse_when(when, code)
+            if not isinstance(parsed, str):
+                day = parsed[0].date()
+                rows = [r for r in rows if r["due"] and datetime.fromtimestamp(r["due"], timetable.LOCAL).date() == day]
+        if not rows:
+            return f"No {code} deadline matches {title!r}" + (f" on {when}" if when else "") + "."
+        if len(rows) > 1:
+            return "Several match; say which date: " + "; ".join(
+                f"{r['title']} ({describe_due(r['due'], r['precision'])})" for r in rows) + "."
+        r = rows[0]
+        if restore:
+            db.execute("DELETE FROM dismissed WHERE key=?", (r["key"],))
+        else:
+            db.execute("INSERT OR REPLACE INTO dismissed (key, at) VALUES (?, ?)", (r["key"], int(time.time())))
+        db.commit()
+        return (f"{'Brought back' if restore else 'Dismissed'}: {code} {r['title']} "
+                f"({describe_due(r['due'], r['precision'])})" + ("." if restore else "; it won't appear in what's due, digests or reminders."))
+    finally:
+        db.close()
+
+
 # --- Answering --------------------------------------------------------------------------------
 def describe_due(due: int, precision: str, now: datetime | None = None) -> str:
     now = now or timetable.now()
@@ -291,7 +326,8 @@ def upcoming(days: int = 7, course: str = "", include_done: bool = False) -> lis
     db = _connect()
     try:
         rows = [dict(r) for r in db.execute(
-            "SELECT * FROM items WHERE removed IS NULL AND due IS NOT NULL AND due BETWEEN ? AND ? ORDER BY due",
+            "SELECT * FROM items WHERE removed IS NULL AND due IS NOT NULL AND due BETWEEN ? AND ? "
+            "AND key NOT IN (SELECT key FROM dismissed) ORDER BY due",
             (now - 14 * 86400, now + days * 86400))]
     finally:
         db.close()

@@ -25,6 +25,9 @@ READ_ONLY = {
     "mod_assign_get_submission_status",
     "mod_quiz_get_quizzes_by_courses",
     "mod_quiz_get_user_attempts",
+    # Announcements (slice 3c): each course's news forum and its discussions.
+    "mod_forum_get_forums_by_courses",
+    "mod_forum_get_forum_discussions",
 }
 
 

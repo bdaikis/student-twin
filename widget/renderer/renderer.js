@@ -387,7 +387,7 @@ function openTyping() {
     echo.textContent = last.request;
     body.className = 'body';
     if (last.kind === 'done') body.innerHTML = '<span class="done">✓</span>';
-    else body.textContent = last.text.trim();
+    else body.innerHTML = renderMarkdown(last.text.trim()); // the whole answer, scrollable
   } else {
     echo.textContent = '';
     body.textContent = '';

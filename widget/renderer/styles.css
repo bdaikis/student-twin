@@ -152,7 +152,8 @@ button { font: inherit; color: inherit; }
 @keyframes blink { 50% { opacity: 0; } }
 .note { color: var(--text-muted); font-size: 12px; margin-left: 6px; }
 .body .done { color: var(--ok); font-weight: 600; }
-[data-view="typing"] .body { color: var(--text-muted); font-size: 12px; line-height: 16px; max-height: 48px; overflow: hidden; margin-bottom: 8px; }
+/* The last exchange, reopened by a click on the dot: the whole answer, scrollable, above the input. */
+[data-view="typing"] .body { margin-bottom: 10px; max-height: calc(var(--body-max) - 60px); }
 
 .shell[data-view="error"].card-view .card { display: flex; flex-direction: column; }
 [data-view="error"] .body { position: relative; padding-left: 24px; padding-right: 18px; }

@@ -284,6 +284,15 @@ const WIDGET_RULES = [
   "Irreversible tools such as delete_files show him a confirm card themselves and wait for his click: call them directly, without asking for confirmation in chat, and never retry one he cancelled. When he cancels the card or it times out, reply with only ${DONE_MARK}: the card already shows the outcome. Never claim something was deleted unless the tool result says so.",
 ].join(' ');
 
+// Hermes's prompt carries only the date the conversation started, so every widget request says
+// the time it was sent. The portal tool `now` adds the semester week and the next class.
+function clockLine() {
+  const t = new Date();
+  const when = t.toLocaleString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kuala_Lumpur' });
+  return `The current local time is ${when} (Malaysia, UTC+08:00); trust it over any date elsewhere in your context.`;
+}
+
 // Stream one answer from Hermes, forwarding text deltas to the renderer as they arrive.
 async function ask(sender, id, text) {
   const controller = new AbortController();
@@ -299,7 +308,7 @@ async function ask(sender, id, text) {
       body: JSON.stringify({
         model: 'hermes-agent',
         stream: true,
-        messages: [{ role: 'system', content: WIDGET_RULES }, { role: 'user', content: text }],
+        messages: [{ role: 'system', content: `${WIDGET_RULES} ${clockLine()}` }, { role: 'user', content: text }],
       }),
       signal: controller.signal,
     });

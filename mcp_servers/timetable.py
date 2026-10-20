@@ -106,6 +106,24 @@ def now() -> datetime:
     return datetime.now(LOCAL)
 
 
+def semester_status(day: datetime) -> str:
+    """Where `day` falls in the semester, from "semester" in the per-user config: "Semester I week 3
+    (lectures)", "mid-semester break", ... ("" when the config has no calendar or the day is outside it)."""
+    from common import config
+    sem = config().get("semester") or {}
+    d = day.date()
+    for period in sem.get("periods", []):
+        start = datetime.strptime(period["from"], "%Y-%m-%d").date()
+        end = datetime.strptime(period["to"], "%Y-%m-%d").date()
+        if start <= d <= end:
+            name = sem.get("name", "the semester")
+            if "first_week" in period:
+                week = period["first_week"] + (d - start).days // 7
+                return f"{name}, week {week} ({period['label']})"
+            return f"{name}: {period['label']}"
+    return ""
+
+
 def on_day(day: datetime) -> list[ClassBlock]:
     return [c for c in classes() if c.start.date() == day.date()]
 

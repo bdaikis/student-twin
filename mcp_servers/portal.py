@@ -35,6 +35,44 @@ SNAPSHOTS = DATA / "attendance_snapshots"
 LOG = DATA / "attendance_log.jsonl"
 
 
+def _until(delta: timedelta) -> str:
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 60:
+        return f"in {minutes} min"
+    h, m = divmod(minutes, 60)
+    if h < 24:
+        return f"in {h} h {m} min" if m else f"in {h} h"
+    return f"in {h // 24} day{'s' if h // 24 > 1 else ''}"
+
+
+@server.tool()
+def now() -> str:
+    """The current date and time where Bhanu is (Malaysia, UTC+08:00), the week of his semester, and
+    the class he is in now or has next. Call it for "what time is it", "what's the date", "what day is
+    it", "what's next", "how long until my class", or anything that depends on today: the date in your
+    prompt is when this conversation started and can be days old, and you have no clock or terminal."""
+    t = timetable.now()
+    lines = [f"{t:%A %d %B %Y, %H:%M} (Malaysia time, UTC+08:00)."]
+    status = timetable.semester_status(t)
+    if status:
+        lines.append(status[0].upper() + status[1:] + ".")
+    try:
+        classes = timetable.classes()
+    except RuntimeError as exc:
+        lines.append(f"Timetable unavailable: {exc}")
+        return " ".join(lines)
+    running = [b for b in classes if b.start <= t < b.end]
+    upcoming = [b for b in classes if b.start > t][:1]
+    for b in running:
+        lines.append(f"Now: {b.line()} (ends at {b.end:%H:%M}).")
+    if upcoming:
+        b = upcoming[0]
+        lines.append(f"Next: {b.line()} ({_until(b.start - t)}).")
+    elif not running:
+        lines.append("No more classes in the timetable.")
+    return " ".join(lines)
+
+
 @server.tool()
 def timetable_day(day: str = "today") -> str:
     """Bhanu's classes on a day, from his calendar: time, course, lecture or lab, room (or online).

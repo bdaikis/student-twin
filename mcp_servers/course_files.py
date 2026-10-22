@@ -4,8 +4,9 @@
 Where: config "files": {"root": "...", "course_folders": {"SIF1003": "Thermal Physics", ...}}. A course
 with no folder named there gets one named after the course. Inside it, one subfolder per portal
 section, so files keep the order the lecturer posted them in.
-What: "notes" (documents and slides, the default), "videos", or "all"; `match` narrows by words in
-the section, activity or file name ("module 3", "tutorial").
+What: "notes" (documents and slides, the default) or "all" (any file type); `match` narrows by
+words in the section, activity or file name ("module 3", "tutorial"). Videos are never downloaded,
+and courses in config files.skip_courses are left out entirely (Bhanu, 2026-10-22).
 A file already anywhere under the root with the same name and size is skipped, so files he saved
 himself (or an earlier run) aren't fetched twice. A file whose name exists with a different size is
 saved beside it with the portal's date, never over it.
@@ -80,6 +81,8 @@ def plan(code: str, info: dict, what: str = "notes", match: str = "") -> dict:
                 if want and not want <= words:
                     continue
                 kind = _kind(f["filename"])
+                if kind == "videos":
+                    continue
                 if what != "all" and kind != what:
                     n, size = left_out.get(kind, (0, 0))
                     left_out[kind] = (n + 1, size + f.get("filesize", 0))
@@ -108,15 +111,18 @@ def _mb(n: int) -> str:
 
 
 def download(course: str = "", what: str = "notes", match: str = "", allow_large: bool = False) -> str:
-    if what not in ("notes", "videos", "all"):
-        return 'what must be "notes", "videos" or "all".'
+    if what not in ("notes", "all"):
+        return 'what must be "notes" or "all". Videos are never downloaded.'
+    skip = set(config().get("files", {}).get("skip_courses", []))
     if course:
         found = match_course(course)
         if isinstance(found, str):
             return found
+        if found[0] in skip:
+            return f"{found[0]} is excluded from downloads by Bhanu's own choice; nothing was downloaded. The twin can't change that; Claude Code can, in its settings."
         courses = [found]
     else:
-        courses = list(config().get("courses", {}).items())
+        courses = [(c, i) for c, i in config().get("courses", {}).items() if c not in skip]
     plans = [plan(code, info, what, match) for code, info in courses]
     total = sum(f.get("filesize", 0) for p in plans for f, _ in p["get"])
     if total > ASK_ABOVE_MB * 1e6 and not allow_large:

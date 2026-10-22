@@ -9,6 +9,7 @@ import ctypes
 import ctypes.wintypes as wt
 import html
 import json
+import os
 import re
 import time
 import urllib.parse
@@ -132,16 +133,59 @@ class Moodle:
         req = urllib.request.Request(f"{self.site}/webservice/rest/server.php?moodlewsrestformat=json",
                                      data=urllib.parse.urlencode(fields).encode(),
                                      headers={"User-Agent": "student-twin"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.load(resp)
-        except OSError as exc:
-            raise MoodleError(f"couldn't reach {self.site}: {exc}") from None
+        for attempt in (1, 2):  # reads retry once: the portal sometimes drops a connection
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.load(resp)
+                break
+            except OSError as exc:
+                if _marking or attempt == 2:
+                    raise MoodleError(f"couldn't reach {self.site}: {exc}") from None
+                time.sleep(2)
         if isinstance(data, dict) and "exception" in data:
             raise MoodleError(f"{function} failed: {data.get('errorcode')} ({data.get('message')})")
         if not _marking:
             self._cache[key] = (time.time(), data)
         return data
+
+    def download(self, fileurl: str, dest, timemodified: int | None = None, size: int | None = None) -> int:
+        """Save one course file (a fileurl from core_course_get_contents) to `dest`. Only the site's
+        web-service file endpoint is allowed, and the token goes in the POST body, never the URL.
+        Written to a .part file first and checked against the portal's `size` (a dropped connection
+        once ended a 5.2 MB file at 0.97 MB with no error), retried once, so a failed download never
+        leaves half a file."""
+        from pathlib import Path
+        if not fileurl.startswith(f"{self.site}/webservice/pluginfile.php/"):
+            raise MoodleError("only course files from the portal can be downloaded")
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_name(dest.name + ".part")
+        req = urllib.request.Request(fileurl.split("?")[0], headers={"User-Agent": "student-twin"},
+                                     data=urllib.parse.urlencode({"token": _load_token(self.credential)}).encode())
+        for attempt in (1, 2):
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp, open(part, "wb") as out:
+                    if "json" in (resp.headers.get("Content-Type") or ""):
+                        raise MoodleError(f"the portal refused the file: {resp.read(300).decode('utf-8', 'replace')}")
+                    got = 0
+                    while chunk := resp.read(1 << 16):
+                        out.write(chunk)
+                        got += len(chunk)
+                if size and got != size:
+                    raise OSError(f"got {got} of {size} bytes")
+                part.replace(dest)
+                break
+            except OSError as exc:
+                part.unlink(missing_ok=True)
+                if attempt == 2:
+                    raise MoodleError(f"couldn't download {dest.name}: {exc}") from None
+                time.sleep(2)
+            except MoodleError:
+                part.unlink(missing_ok=True)
+                raise
+        if timemodified:
+            os.utime(dest, (timemodified, timemodified))
+        return got
 
     def course_contents(self, course_id: int) -> list[dict]:
         """Sections of a course, each with its visible modules (name, type, view URL, file names)."""

@@ -17,6 +17,7 @@ from datetime import timedelta
 
 from mcp.server.mcpserver import MCPServer
 
+import course_files
 import deadlines as dl
 import timetable
 from common import (DATA, PRESENT, course_contents, course_id, match_course, moodle, remember_sessions,
@@ -130,6 +131,17 @@ def dismiss_deadline(course: str, title: str, when: str = "", restore: bool = Fa
     what's due, the digests or the reminders. `when` (its due date) picks between items with the
     same title; `restore=True` brings it back. Only when he asks."""
     return dl.dismiss(course, title, when, restore)
+
+
+@server.tool()
+def download_course_files(course: str = "", what: str = "notes", match: str = "", allow_large: bool = False) -> str:
+    """Save Bhanu's course files from the portal into his course folders on this computer (no browser),
+    and say where they went. `course`: code or part of a name; empty means every course. `what`:
+    "notes" (documents and slides, the default), "videos" or "all". `match`: words that narrow it
+    ("module 3", "tutorial"). Files he already has are skipped. Over 200 MB it asks first: tell him
+    the size and call again with allow_large=True only if he agrees. Use this, not the browser, when he
+    asks to download or get course files; the folder it names can be passed to later steps."""
+    return course_files.download(course, what, match, allow_large)
 
 
 @server.tool()

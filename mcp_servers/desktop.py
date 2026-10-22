@@ -1332,6 +1332,163 @@ def screen_scroll(window: str, direction: str = "down", amount: int = 5) -> str:
     time.sleep(0.4)
     return f"Scrolled {d} {amount} notches in {win['title']!r}; look again to see the result."
 
+# --- File picker: fill a website's or app's Windows "Open" box (step 2 of the NotebookLM plan) ---
+
+_UPLOADS = Path(os.environ["LOCALAPPDATA"]) / "student-twin" / "uploads"
+_MAX_PICK = 50
+user32.GetWindow.restype = wt.HWND
+user32.GetParent.restype = wt.HWND
+user32.SendMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, ctypes.c_void_p]
+user32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+
+
+def _class_name(hwnd) -> str:
+    buf = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, buf, 64)
+    return buf.value
+
+
+def _name_box(dialog):
+    """The dialog's "File name" edit box (inside the control with id 1148), or None."""
+    found = []
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def each(hwnd, _):
+        if _class_name(hwnd) == "Edit":
+            parent = user32.GetParent(hwnd)
+            if 1148 in (user32.GetDlgCtrlID(parent), user32.GetDlgCtrlID(user32.GetParent(parent))):
+                found.append(hwnd)
+                return False
+        return True
+
+    user32.EnumChildWindows(dialog, each, 0)
+    return found[0] if found else None
+
+
+def _file_dialogs() -> list[dict]:
+    """Open file dialogs on screen, each with the window that opened it."""
+    out = []
+
+    @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    def each(hwnd, _):
+        if user32.IsWindowVisible(hwnd) and _class_name(hwnd) == "#32770":
+            box = _name_box(hwnd)
+            if box:
+                owner = user32.GetWindow(hwnd, 4) or hwnd  # GW_OWNER
+                out.append({"hwnd": hwnd, "box": box, "title": _window_title(hwnd),
+                            "owner": _window_title(owner), "process": _process_name(owner)})
+        return True
+
+    user32.EnumWindows(each, 0)
+    return out
+
+
+def _accepts_many(dialog) -> bool | None:
+    """Whether the Open box allows several files (its file list's CanSelectMultiple), None if unknown.
+    A one-file box given several names silently takes the first (seen in Chrome, 23 Oct 2026)."""
+    import uiautomation as auto
+    try:
+        with auto.UIAutomationInitializerInThread():
+            for c, _ in auto.WalkControl(auto.ControlFromHandle(dialog), maxDepth=8):
+                if c.ControlTypeName == "ListControl" and c.Name == "Items View":
+                    return bool(c.GetSelectionPattern().CanSelectMultiple)
+    except Exception:
+        pass
+    return None
+
+
+def _dialog_submit(dialog, box, text: str) -> None:
+    user32.SendMessageW(box, 0x000C, 0, ctypes.c_wchar_p(text))  # WM_SETTEXT
+    user32.PostMessageW(dialog, 0x0111, 1, 0)  # WM_COMMAND IDOK: the Open button
+
+
+def _stage(files: list[Path]) -> Path:
+    """One folder holding all `files` (the Open box selects several files only within one folder):
+    hard links, so no space is used and the originals are untouched; a copy if linking fails."""
+    import shutil
+    if _UPLOADS.exists():
+        for old in _UPLOADS.iterdir():  # yesterday's batches are no longer needed
+            if time.time() - old.stat().st_mtime > 86400:
+                shutil.rmtree(old, ignore_errors=True)
+    folder = _UPLOADS / time.strftime("%Y%m%d-%H%M%S")
+    folder.mkdir(parents=True)
+    for f in files:
+        dest = folder / f.name
+        n = 2
+        while dest.exists():
+            dest = folder / f"{f.stem} ({n}){f.suffix}"
+            n += 1
+        try:
+            os.link(f, dest)
+        except OSError:
+            shutil.copy2(f, dest)
+    return folder
+
+
+@server.tool()
+def pick_files(folder: str, pattern: str = "*", recursive: bool = False, names: str = "", window: str = "") -> str:
+    """Fill an open Windows "Open"/upload box with files and press Open, so a website (e.g. NotebookLM's
+    "Add source" upload) or app receives them. First make the site open its file box (ui_click or
+    screen_click on its upload button), then call this. `folder`: a path or spoken name ("Thermal
+    Physics" in his course folder works by name); `pattern` like "*.pdf"; `recursive` takes files from
+    subfolders too (course folders keep one subfolder per section); `names`: specific file names
+    separated by ";" instead of a pattern. `window`: the window that opened the box, if several are
+    open. Up to 50 files. This hands files to the website: only for files Bhanu asked to add, to the
+    site he named. Never for messaging or email windows."""
+    base = _resolve_folder(folder)
+    if isinstance(base, str):
+        return base
+    if names:
+        files, missing = [], []
+        for n in [n.strip() for n in names.split(";") if n.strip()]:
+            hit = base / n if (base / n).is_file() else next(iter(sorted(base.rglob(n))), None) if recursive else None
+            (files if hit else missing).append(hit or n)
+        if missing:
+            return f"Not found in {base}: {'; '.join(missing)}. Nothing was picked."
+    else:
+        files, complete = _matches(base, pattern, recursive, None, time_limit=_SHORT_SEARCH_S)
+        files = sorted(files)
+        if not complete:
+            return f"Searching {base} took too long; name a narrower folder. Nothing was picked."
+    files = [f for f in files if not f.name.endswith((".part", ".tmp")) and not f.name.startswith("~$")]
+    if not files:
+        return f"No files match {pattern!r} in {base}" + (" or its subfolders" if recursive else "") + ". Nothing was picked."
+    if len(files) > _MAX_PICK:
+        return f"That's {len(files)} files; the most at once is {_MAX_PICK}. Narrow it with a pattern or a subfolder."
+    dialogs = _file_dialogs()
+    if window:
+        q = _norm(window)
+        dialogs = [d for d in dialogs if q in _norm(d["owner"]) or q in _norm(d["process"])]
+    if not dialogs:
+        return ("No file Open box is open" + (f" for {window!r}" if window else "") +
+                ". Click the site's upload button first (ui_click or screen_click), then call pick_files.")
+    if len(dialogs) > 1:
+        return "Several Open boxes are open: " + "; ".join(f"{d['title']!r} from {d['owner']!r}" for d in dialogs) + ". Say which window."
+    d = dialogs[0]
+    if _MESSAGING.search(d["owner"]) or _MESSAGING.search(d["process"]):
+        return f"Refused: the Open box belongs to {d['owner']!r}, a messaging or email window; Bhanu sends files there himself."
+    if len(files) > 1 and _accepts_many(d["hwnd"]) is False:
+        return (f"The Open box of {d['owner']!r} takes one file at a time, and {len(files)} match. Nothing was "
+                "picked; name one file, or pick them one by one.")
+    where = files[0].parent if len({f.parent for f in files}) == 1 else _stage(files)
+    shown = [f.name for f in files] if where == files[0].parent else sorted(p.name for p in where.iterdir())
+    if len(shown) == 1:
+        _dialog_submit(d["hwnd"], d["box"], str(where / shown[0]))
+    else:
+        _dialog_submit(d["hwnd"], d["box"], str(where))  # navigate into the folder first
+        time.sleep(1.0)
+        if not user32.IsWindow(d["hwnd"]):
+            return "The Open box closed when its folder was set; nothing was picked. Open it again and retry."
+        _dialog_submit(d["hwnd"], d["box"], " ".join(f'"{n}"' for n in shown))
+    for _ in range(25):
+        time.sleep(0.2)
+        if not user32.IsWindow(d["hwnd"]) or not user32.IsWindowVisible(d["hwnd"]):
+            size = sum(f.stat().st_size for f in files)
+            return (f"Picked {len(files)} file(s) ({_size(size)}) from {base} in the Open box of {d['owner']!r}; "
+                    "the box closed, so the site has them. Its page shows any upload progress or rejected types.")
+    return (f"The Open box of {d['owner']!r} is still open after choosing the files; it may be showing an "
+            "error (a file type the site doesn't accept, or a single-file box). Look at it with screen_look.")
+
 
 if __name__ == "__main__":
     server.run("stdio")

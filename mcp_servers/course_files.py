@@ -48,13 +48,13 @@ def _key(name: str) -> str:
     return re.sub(r" \(SPeCTRUM \d{4}-\d{2}-\d{2}\)(?=\.[^.]*$|$)", "", _safe(name)).lower()
 
 
-def _have() -> set[tuple[str, int]]:
-    out = set()
+def _have() -> dict[tuple[str, int], Path]:
+    out = {}
     if root().exists():
         for dirpath, _, names in os.walk(root()):
             for n in names:
                 try:
-                    out.add((_key(n), os.path.getsize(os.path.join(dirpath, n))))
+                    out.setdefault((_key(n), os.path.getsize(os.path.join(dirpath, n))), Path(dirpath) / n)
                 except OSError:
                     pass
     return out
@@ -65,7 +65,7 @@ def plan(code: str, info: dict, what: str = "notes", match: str = "") -> dict:
     want = set(norm(match).split())
     have = _have()
     base = course_folder(code, info)
-    get, already, links, left_out, taken = [], [], [], {}, set()
+    get, already, elsewhere, links, left_out, taken = [], [], [], [], {}, set()
     for sec in moodle().call("core_course_get_contents", courseid=course_id(info)):
         section = _safe(sec.get("name") or f"Section {sec.get('section')}")
         for mod in sec.get("modules", []):
@@ -87,8 +87,11 @@ def plan(code: str, info: dict, what: str = "notes", match: str = "") -> dict:
                     n, size = left_out.get(kind, (0, 0))
                     left_out[kind] = (n + 1, size + f.get("filesize", 0))
                     continue
-                if (_key(f["filename"]), f.get("filesize", 0)) in have:
-                    already.append(f["filename"])
+                found = have.get((_key(f["filename"]), f.get("filesize", 0)))
+                if found:
+                    # One saved outside the course folder (he files some in his own places) is named,
+                    # so "17 already there" doesn't contradict the 16 files in the course folder.
+                    (already if found.is_relative_to(base) else elsewhere).append(found)
                     continue
                 folder = base / section
                 if mod.get("modname") == "folder":  # a folder activity keeps its own name and subfolders
@@ -103,7 +106,7 @@ def plan(code: str, info: dict, what: str = "notes", match: str = "") -> dict:
                         continue
                 taken.add(dest)
                 get.append((f, dest))
-    return {"code": code, "base": base, "get": get, "have": already, "left_out": left_out, "links": links}
+    return {"code": code, "base": base, "get": get, "have": already, "elsewhere": elsewhere, "left_out": left_out, "links": links}
 
 
 def _mb(n: int) -> str:
@@ -144,6 +147,9 @@ def download(course: str = "", what: str = "notes", match: str = "", allow_large
             parts.append(f"saved {done} file{'s' if done > 1 else ''} ({_mb(saved)})")
         if p["have"]:
             parts.append(f"{len(p['have'])} already there")
+        if p["elsewhere"]:
+            parts.append(f"{len(p['elsewhere'])} already saved outside this course folder, so not in it ("
+                         + "; ".join(str(x.relative_to(root())) if x.is_relative_to(root()) else str(x) for x in p["elsewhere"][:5]) + ")")
         for kind, (n, size) in sorted(p["left_out"].items()):
             if kind != "other" or n:
                 parts.append(f"{n} {kind if kind != 'other' else 'other files'} left out ({_mb(size)})")

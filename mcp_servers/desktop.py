@@ -32,7 +32,7 @@ import winreg
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 
 from common import CONFIG_PATH, config as _config, course_contents as _course_contents
 from common import match_course as _match_course, norm as _norm
@@ -501,6 +501,8 @@ def window(name: str, action: str = "focus") -> str:
     closes as that tab only. A browser, editor, document or terminal window you didn't open is not
     closed: the result asks which one, and you close it only after he says so, by passing its exact
     full title. Never close on a guess from an unclear command (a single word like "off")."""
+    if (locked := _locked()):
+        return locked
     act = action.strip().lower().replace(" ", "_")
     if act not in ("focus", "maximize", "minimize", "restore", "close", "close_tab"):
         return "Unknown action; use focus, maximize, minimize, restore, close or close_tab."
@@ -583,6 +585,8 @@ def arrange_windows(left: str, right: str) -> str:
     """Put two windows side by side, each filling half of the screen, both in front; the left one gets
     keyboard focus. `left` and `right` are part of a window title (e.g. "PyTorch") or a program
     ("VS Code", "Chrome", "Spotify"). Open a page first with open_url if it isn't open yet."""
+    if (locked := _locked()):
+        return locked
     lw, rw = (next(iter(_find_windows(left)), None), next(iter(_find_windows(right)), None))
     missing = [name for name, w in ((left, lw), (right, rw)) if w is None]
     if missing:
@@ -851,10 +855,11 @@ def _recycle(paths: list[Path]) -> int:
 
 @server.tool()
 async def delete_files(folder: str, pattern: str, recursive: bool = False,
-                       older_than_days: float | None = None, keep_searching: bool = False) -> str:
-    """Move files to the Recycle Bin, after Bhanu confirms on the widget's confirm card. The tool
-    shows the card itself and waits up to 60 s: never ask him to confirm in chat first, and don't
-    retry after a cancel. `folder` as in list_files; `pattern` a wildcard ("*.zip", "*" for every
+                       older_than_days: float | None = None, keep_searching: bool = False,
+                       ctx: Context | None = None) -> str:
+    """Move files to the Recycle Bin, after Bhanu confirms: a card on the widget, or Confirm/Cancel
+    buttons on Telegram. The tool asks him itself and waits: never ask him to confirm in chat first,
+    and don't retry after a cancel. `folder` as in list_files; `pattern` a wildcard ("*.zip", "*" for every
     file); `older_than_days` keeps newer files. Files only, never folders."""
     path = _resolve_folder(folder)
     if isinstance(path, str):
@@ -882,7 +887,7 @@ async def delete_files(folder: str, pattern: str, recursive: bool = False,
     if max(sizes) >= 1024 ** 3:
         details.append("Files too large for the Recycle Bin are deleted permanently")
     import confirm  # local module, imported lazily like moodle
-    decision = await confirm.ask(summary, details, action="Delete")
+    decision = await confirm.ask_where(ctx, summary, details, action="Delete")
     if decision != "confirm":
         return confirm.OUTCOME[decision]
     code = _recycle(files)
@@ -942,8 +947,32 @@ _UI_KINDS = {"ButtonControl": "button", "HyperlinkControl": "link", "MenuItemCon
 _ACTIONABLE = {"button", "link", "menu item", "list item", "tab", "tree item", "checkbox", "radio button", "row"}
 
 
+# --- Locked laptop (2026-10-24): Telegram requests can arrive while the screen is locked, when
+# Windows lets no program read or drive it. Screen tools say so at once instead of failing halfway.
+
+def _locked() -> str | None:
+    """A refusal sentence when the session is locked, else None (fails open if Windows won't say)."""
+    wtsapi = ctypes.WinDLL("wtsapi32")
+    buf, size = ctypes.c_void_p(), wt.DWORD()
+    try:
+        # WTSSessionInfoEx (25) for the current session: WTSINFOEXW.Level1.SessionFlags at offset 16,
+        # 0 = locked, 1 = unlocked on Windows 10 and 11.
+        if not wtsapi.WTSQuerySessionInformationW(None, wt.DWORD(-1 & 0xFFFFFFFF), 25, ctypes.byref(buf), ctypes.byref(size)):
+            return None
+        flags = ctypes.c_long.from_address(buf.value + 16).value
+        wtsapi.WTSFreeMemory(buf)
+    except Exception:
+        return None
+    if flags == 0:
+        return ("Bhanu's laptop is locked, so nothing on its screen can be read or done; "
+                "tell him to unlock it and ask again.")
+    return None
+
+
 def _ui_window(name: str):
     """(window dict, error) for a window the accessibility tools may use."""
+    if (locked := _locked()):
+        return None, locked
     hits = _find_windows(name)
     if not hits:
         return None, f"No open window matches {name!r}. Use list_windows to see what's open."
@@ -1426,7 +1455,8 @@ def _stage(files: list[Path]) -> Path:
 
 
 @server.tool()
-def pick_files(folder: str, pattern: str = "*", recursive: bool = False, names: str = "", window: str = "") -> str:
+async def pick_files(folder: str, pattern: str = "*", recursive: bool = False, names: str = "", window: str = "",
+                     ctx: Context | None = None) -> str:
     """Fill an open Windows "Open"/upload box with files and press Open, so a website (e.g. NotebookLM's
     "Add source" upload) or app receives them. First make the site open its file box (ui_click or
     screen_click on its upload button), then call this. `folder`: a path or spoken name ("Thermal
@@ -1434,7 +1464,8 @@ def pick_files(folder: str, pattern: str = "*", recursive: bool = False, names: 
     subfolders too (course folders keep one subfolder per section); `names`: specific file names
     separated by ";" instead of a pattern. `window`: the window that opened the box, if several are
     open. Up to 50 files. This hands files to the website: only for files Bhanu asked to add, to the
-    site he named. Never for messaging or email windows."""
+    site he named. Never for messaging or email windows. On Telegram it asks him with Confirm/Cancel
+    buttons first (he can't see the screen); on the widget it doesn't."""
     base = _resolve_folder(folder)
     if isinstance(base, str):
         return base
@@ -1455,6 +1486,8 @@ def pick_files(folder: str, pattern: str = "*", recursive: bool = False, names: 
         return f"No files match {pattern!r} in {base}" + (" or its subfolders" if recursive else "") + ". Nothing was picked."
     if len(files) > _MAX_PICK:
         return f"That's {len(files)} files; the most at once is {_MAX_PICK}. Narrow it with a pattern or a subfolder."
+    if (locked := _locked()):
+        return locked
     dialogs = _file_dialogs()
     if window:
         q = _norm(window)
@@ -1470,6 +1503,12 @@ def pick_files(folder: str, pattern: str = "*", recursive: bool = False, names: 
     if len(files) > 1 and _accepts_many(d["hwnd"]) is False:
         return (f"The Open box of {d['owner']!r} takes one file at a time, and {len(files)} match. Nothing was "
                 "picked; name one file, or pick them one by one.")
+    import confirm
+    names_shown = [f.name for f in files[:8]] + ([f"…and {len(files) - 8} more"] if len(files) > 8 else [])
+    decision = await confirm.ask_where(ctx, f"Upload {len(files)} file(s) from {base.name} to {d['owner']}?",
+                                       names_shown, action="Upload", widget_too=False)
+    if decision != "confirm":
+        return confirm.OUTCOME.get(decision, "Nothing was picked.") + " The Open box is still open."
     where = files[0].parent if len({f.parent for f in files}) == 1 else _stage(files)
     shown = [f.name for f in files] if where == files[0].parent else sorted(p.name for p in where.iterdir())
     if len(shown) == 1:
@@ -1488,6 +1527,30 @@ def pick_files(folder: str, pattern: str = "*", recursive: bool = False, names: 
                     "the box closed, so the site has them. Its page shows any upload progress or rejected types.")
     return (f"The Open box of {d['owner']!r} is still open after choosing the files; it may be showing an "
             "error (a file type the site doesn't accept, or a single-file box). Look at it with screen_look.")
+
+
+@server.tool()
+def send_screenshot(window: str) -> str:
+    """Save a screenshot of one window so it can be sent to Bhanu on Telegram, where he can't see the
+    laptop: put the returned MEDIA line on its own line in the reply. Use after a request that changed
+    something on screen. Not on the widget (he sees the screen), never messaging windows."""
+    win, err = _ui_window(window)
+    if err:
+        return err
+    img, _ = _capture(win["hwnd"])
+    w, h = img.size
+    scale = min(1.0, 1600 / max(w, h))
+    if scale < 1.0:
+        img = img.resize((round(w * scale), round(h * scale)))
+    # Hermes sends MEDIA files only from its own cache folders; screenshots/ is one of them.
+    folder = Path(os.environ.get("HERMES_HOME") or Path(os.environ["LOCALAPPDATA"]) / "hermes") / "cache" / "screenshots"
+    folder.mkdir(parents=True, exist_ok=True)
+    for old in folder.glob("twin-*.jpg"):  # keep the folder from growing: a day is plenty
+        if time.time() - old.stat().st_mtime > 86400:
+            old.unlink(missing_ok=True)
+    out = folder / f"twin-{time.strftime('%Y%m%d-%H%M%S')}.jpg"
+    img.convert("RGB").save(out, format="JPEG", quality=82)
+    return f"Screenshot of {win['title']!r} saved. Put this line, alone, in your reply:\nMEDIA:{out}"
 
 
 if __name__ == "__main__":

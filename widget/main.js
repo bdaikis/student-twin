@@ -22,7 +22,20 @@ app.on('second-instance', () => showWidget());
 const HERMES_URL = 'http://127.0.0.1:8642/v1/chat/completions';
 const HERMES_HEALTH = 'http://127.0.0.1:8642/health';
 const HERMES_ENV = path.join(process.env.HERMES_HOME || path.join(process.env.LOCALAPPDATA, 'hermes'), '.env');
-let sessionId = null; // X-Hermes-Session-Id: one conversation per widget run
+let sessionId = null; // X-Hermes-Session-Id when no Telegram conversation exists yet
+// The widget and Telegram share one conversation: each request continues Telegram's current
+// session, read from Hermes's routing mirror, so a /new on Telegram starts a new one for both.
+const HERMES_SESSIONS = path.join(process.env.HERMES_HOME || path.join(process.env.LOCALAPPDATA, 'hermes'), 'sessions', 'sessions.json');
+function sharedSessionId() {
+  try {
+    const all = Object.values(JSON.parse(fs.readFileSync(HERMES_SESSIONS, 'utf8')))
+      .filter((s) => s && s.platform === 'telegram' && s.chat_type === 'dm' && s.session_id);
+    all.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
+    return all.length ? all[0].session_id : null;
+  } catch {
+    return null;
+  }
+}
 const inflight = new Map(); // request id -> AbortController
 
 // Geometry, in DIP. The renderer reports the visible shape's size; the window adds a transparent
@@ -267,21 +280,16 @@ function explain(err) {
   return `Couldn't reach the twin (${err && err.message ? err.message : 'unknown error'}).`;
 }
 
-// Sent with every widget question as a system message. Hermes does not pass MCP server
-// instructions to the model, so the desktop guidance lives here; Telegram never sees it.
+// Sent with every widget question as a system message. The rules both channels share (tools,
+// windows, screen control, confirmation) are in Hermes's SOUL.md; these are the widget's own.
 // DONE_MARK must match the renderer's.
 const DONE_MARK = '✓';
 const WIDGET_RULES = [
-  "You are answering through Bhanu's desktop widget. Requests arrive typed or as speech-recognition",
+  "You are answering through Bhanu's desktop widget, at the laptop. Requests arrive typed or as speech-recognition",
   'transcripts, which can mishear names and short commands.',
   `When a request is a command (open, close, play, pause, arrange, focus, minimize, delete and the like) and every action it needed succeeded exactly as asked, reply with only the single character ${DONE_MARK} and nothing else; the widget shows a tick instead of text. This includes an irreversible action he confirmed on the card: a successful delete also gets only ${DONE_MARK}.`,
   'Reply in words instead when an action failed or only partly worked, when you had to guess what he meant (say what you assumed), when you need to ask him something, or when he asked for information such as the weather, what is posted in a course, or what a page says.',
-  "Prefer the desktop tools over screen control. Use the weather tool for weather, rain and air quality, and web search for other facts. For anything posted in a course use course_materials and open_course_item; for attendance totals use attendance, and for whether he has been marked today use attendance_today; for his classes on a day use timetable_day. For what is due, overdue, or when something is due use deadlines (never answer that from memory); when he mentions a test or deadline to remember, add_deadline. When he says he is in class (\"here\", \"check me in\"), call mark_attendance. To create a text file use write_text_file.",
-  'To see or act inside an open window (a page in Chrome, a list in File Explorer, a button in an app), use ui_read first, then ui_click or ui_type by the element names it returns. Use web_extract only for pages that are not open on screen.',
-  'When ui_read cannot see what you need (a game, an image or chart, a grid or canvas, buttons without names) or the question is about how something looks, use screen_look on that window, then screen_click, screen_type or screen_scroll with x, y from that image, and look again to check the result. Screen control is slower: use it only when the other tools cannot do the job.',
-  'When a window or app name matches nothing, check list_windows and ask whether he meant the closest-sounding one, naming it.',
-  'Never close anything on a guess: if a close command is unclear (for example a single word such as "off"), ask what to close. When the window tool says it did not close a window of his, ask him, and only then close it by its exact full title.',
-  "Irreversible tools such as delete_files show him a confirm card themselves and wait for his click: call them directly, without asking for confirmation in chat, and never retry one he cancelled. When he cancels the card or it times out, reply with only ${DONE_MARK}: the card already shows the outcome. Never claim something was deleted unless the tool result says so.",
+  `When he cancels a confirm card or it times out, reply with only ${DONE_MARK}: the card already shows the outcome. No screenshots here: he can see the screen.`,
 ].join(' ');
 
 // Hermes's prompt carries only the date the conversation started, so every widget request says
@@ -301,7 +309,9 @@ async function ask(sender, id, text) {
     const key = hermesKey();
     if (!key) throw Object.assign(new Error('no API key'), { status: 401 });
     const headers = { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
-    if (sessionId) headers['X-Hermes-Session-Id'] = sessionId;
+    const session = sharedSessionId() || sessionId;
+    if (session) headers['X-Hermes-Session-Id'] = session;
+    markBusy(true);
     const res = await fetch(HERMES_URL, {
       method: 'POST',
       headers,
@@ -313,7 +323,7 @@ async function ask(sender, id, text) {
       signal: controller.signal,
     });
     if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
-    sessionId = res.headers.get('x-hermes-session-id') || sessionId;
+    sessionId = res.headers.get('x-hermes-session-id') || session;
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -339,6 +349,7 @@ async function ask(sender, id, text) {
     else sender.send('twin:error', { id, message: explain(err) });
   } finally {
     inflight.delete(id);
+    if (!inflight.size) markBusy(false);
   }
 }
 
@@ -446,6 +457,15 @@ const CONFIRM_DIR = path.join(TWIN_DATA, 'confirm');
 const PENDING_DIR = path.join(CONFIRM_DIR, 'pending');
 const ANSWERS_DIR = path.join(CONFIRM_DIR, 'answers');
 const ALIVE_FILE = path.join(CONFIRM_DIR, 'widget.alive');
+// Present while a widget request is running, so a tool needing his confirmation knows the request
+// came from here (card on screen) rather than from Telegram (buttons in the chat).
+const BUSY_FILE = path.join(CONFIRM_DIR, 'widget.busy');
+function markBusy(on) {
+  try {
+    if (on) { fs.mkdirSync(CONFIRM_DIR, { recursive: true }); fs.writeFileSync(BUSY_FILE, String(Date.now())); }
+    else fs.rmSync(BUSY_FILE, { force: true });
+  } catch {}
+}
 const confirmShown = new Map(); // request id -> nonce
 
 function touchAlive() {

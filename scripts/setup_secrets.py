@@ -5,7 +5,9 @@ Run it yourself in a terminal (the prompts hide what you type):
 
 Asks for the Anthropic API key and the Telegram bot token, checks each against its service, and
 writes them to %LOCALAPPDATA%\\hermes\\.env together with your Telegram user ID, so the bot answers
-only you. Other lines in the file are kept. Secrets are never printed.
+only you and the scheduled jobs deliver to your chat (TELEGRAM_HOME_CHANNEL). It also turns on
+Hermes's local API server for the widget with a random key (API_SERVER_KEY), keeping one that is
+already set. Other lines in the file are kept. Secrets are never printed.
 
 Temporary: on Windows, Hermes can only read secrets from this plaintext file. A Windows Credential
 Manager secret source will replace it before the first public release.
@@ -15,6 +17,7 @@ import getpass
 import json
 import os
 import re
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -69,10 +72,15 @@ def main() -> None:
     model_name = check_anthropic(key)
     bot_name = check_telegram(token)
 
+    existing = ENV_PATH.read_text(encoding="utf-8") if ENV_PATH.exists() else ""
+    api_key = re.search(r"^API_SERVER_KEY=(\S+)", existing, re.M)
     write_env({
         "ANTHROPIC_API_KEY": key,
         "TELEGRAM_BOT_TOKEN": token,
         "TELEGRAM_ALLOWED_USERS": user_id,
+        "TELEGRAM_HOME_CHANNEL": user_id,  # a direct chat's id is the user's id
+        "API_SERVER_ENABLED": "true",
+        "API_SERVER_KEY": api_key.group(1) if api_key else secrets.token_urlsafe(32),
     })
     print(f"Anthropic key works ({model_name}). Telegram bot works ({bot_name}).")
     print(f"Saved to {ENV_PATH}; the bot will answer only user {user_id}.")

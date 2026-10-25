@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from mcp.server.mcpserver import Context, MCPServer
 
-from common import CONFIG_PATH, config as _config, course_contents as _course_contents
+from common import CONFIG_PATH, config as _config, course_contents as _course_contents, expand_path as _expand_path
 from common import match_course as _match_course, norm as _norm
 
 
@@ -700,8 +700,9 @@ def _protected() -> list[Path]:
     listed under `protected_folders` in the twin's config."""
     home = Path.home()
     fixed = [home / "AppData", Path(__file__).resolve().parents[1], CONFIG_PATH.parent]
-    return [p.resolve() for p in fixed] + [Path(p).expanduser().resolve()
-                                           for p in _config().get("protected_folders", [])]
+    # expand_path raises on a path it can't expand, so file tools fail closed instead of leaving a
+    # protected folder unprotected.
+    return [p.resolve() for p in fixed] + [_expand_path(p).resolve() for p in _config().get("protected_folders", [])]
 
 
 _SEARCH_ROOTS = ("downloads", "desktop", "documents", "pictures", "videos", "music")
@@ -721,8 +722,14 @@ def _find_named_folder(name: str, under: list[Path] | None = None) -> list[Path]
     key = _folder_key(name)
     if not key:
         return []
-    roots = under or [r for r in (_known_folder(_KNOWN_FOLDERS[k]) for k in _SEARCH_ROOTS) if r] + \
-        sorted(Path.home().glob("OneDrive*"))
+    # Besides the known folders: OneDrive wherever it lives (%OneDrive% may sit under Desktop) and the
+    # course-files folder, so "Thermal Physics" finds his course folder by name.
+    course_root = _config().get("files", {}).get("root")
+    extra = [_expand_path(course_root)] if course_root else []
+    extra += [Path(os.environ[v]) for v in ("OneDrive", "OneDriveConsumer") if os.environ.get(v)]
+    roots = under or list(dict.fromkeys(
+        [r for r in (_known_folder(_KNOWN_FOLDERS[k]) for k in _SEARCH_ROOTS) if r] + extra
+        + sorted(Path.home().glob("OneDrive*"))))
     protected = _protected()
     found = []
     for root in roots:

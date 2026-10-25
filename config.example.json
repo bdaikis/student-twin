@@ -1,0 +1,33 @@
+{
+  "portal": {
+    "name": "Moodle",
+    "url": "https://moodle.example.edu",
+    "token_credential": "student-twin/spectrum-token"
+  },
+  "courses": {
+    "ABC1001": {"name": "Example Course One", "url": "https://moodle.example.edu/course/view.php?id=1234"},
+    "ABC1002": {"name": "Example Course Two", "url": "https://moodle.example.edu/course/view.php?id=1235"}
+  },
+  "semester": {
+    "name": "2026/2027 Semester I",
+    "source": "where the dates come from (the academic calendar)",
+    "periods": [
+      {"from": "2026-10-05", "to": "2026-11-29", "label": "lectures", "first_week": 1},
+      {"from": "2026-11-30", "to": "2026-12-06", "label": "mid-semester break"},
+      {"from": "2026-12-07", "to": "2027-01-17", "label": "lectures", "first_week": 9}
+    ]
+  },
+  "home": {"place": "Your City"},
+  "music": {"default": "Liked Songs", "liked_songs_uri": "spotify:collection:tracks"},
+  "browser_profiles": {
+    "moodle.example.edu": "Profile 1",
+    "notebooklm.google.com": "Profile 1"
+  },
+  "protected_folders": ["%OneDrive%\\Private notes"],
+  "files": {
+    "root": "%OneDrive%\\University",
+    "course_folders": {"ABC1001": "Example Course One"},
+    "skip_courses": []
+  },
+  "voice": {"keep_recordings": false}
+}

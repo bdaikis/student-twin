@@ -14,6 +14,36 @@ DATA = Path(os.environ.get("STUDENT_TWIN_HOME") or Path(os.environ["LOCALAPPDATA
 CONFIG_PATH = DATA / "config.json"
 
 
+def _onedrive_folder() -> str | None:
+    """OneDrive's folder from its own registry entry, for processes started without the user's
+    environment (Hermes passes MCP servers only the variables listed in its config)."""
+    import winreg
+    for key in (r"Software\Microsoft\OneDrive", r"Software\Microsoft\OneDrive\Accounts\Personal"):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+                value = winreg.QueryValueEx(k, "UserFolder")[0]
+                if value:
+                    return value
+        except OSError:
+            continue
+    return None
+
+
+def expand_path(text: str) -> Path:
+    """A config path with environment variables expanded ("%OneDrive%/University"), as an absolute
+    path. %OneDrive% is filled in from the registry when the variable is missing. Raises ValueError
+    rather than return a path with an unexpanded variable, which would otherwise become a relative
+    folder named "%OneDrive%" (it did, 25 Oct 2026)."""
+    if re.search(r"%OneDrive(Consumer)?%", text, re.I) and not os.environ.get("OneDrive"):
+        folder = _onedrive_folder()
+        if folder:
+            text = re.sub(r"%OneDrive(Consumer)?%", lambda _: folder, text, flags=re.I)
+    expanded = os.path.expandvars(text)
+    if re.search(r"%[^%\/]+%|\$\{?\w+", expanded) or not Path(expanded).expanduser().is_absolute():
+        raise ValueError(f"the configured path {text!r} could not be expanded to an absolute path")
+    return Path(expanded).expanduser()
+
+
 def config() -> dict:
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))

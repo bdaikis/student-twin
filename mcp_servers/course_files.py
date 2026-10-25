@@ -17,7 +17,7 @@ import re
 import time
 from pathlib import Path
 
-from common import config, course_id, match_course, moodle, norm
+from common import config, course_id, expand_path, match_course, moodle, norm
 
 NOTES = {"pdf", "ppt", "pptx", "doc", "docx", "xls", "xlsx", "odt", "odp", "ods", "rtf", "txt", "md", "csv"}
 VIDEOS = {"mp4", "m4v", "mov", "mkv", "avi", "webm", "wmv"}
@@ -25,7 +25,10 @@ ASK_ABOVE_MB = 200
 
 
 def root() -> Path:
-    return Path(config().get("files", {}).get("root") or Path.home() / "Documents" / "Course files")
+    # Environment variables are expanded ("%OneDrive%\University Malaya"), so one config works on
+    # every machine whatever its user folder.
+    configured = config().get("files", {}).get("root")
+    return expand_path(configured) if configured else Path.home() / "Documents" / "Course files"
 
 
 def _safe(name: str) -> str:

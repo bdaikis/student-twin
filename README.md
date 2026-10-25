@@ -17,14 +17,97 @@ Irreversible actions (deleting, uninstalling, paying, submitting) need an on-scr
 
 ## Status
 
-Early development. Nothing here is usable yet. It is built in thin slices, each one usable
-before the next starts:
+Early development, used daily by its author on Windows 11. It is built in thin slices, each one
+usable before the next starts:
 
-1. Chat with the twin through Telegram and the desktop.
-2. Push-to-talk voice commands on the desktop.
-3. Deadlines from Moodle.
+1. Chat with the twin through Telegram and the desktop. *(built)*
+2. Push-to-talk voice commands on the desktop. *(built)*
+3. Deadlines from Moodle: questions, a twice-daily digest, change messages and reminders. *(built)*
 4. Semester calendar from course-information documents.
 5. WhatsApp changes, group-project tracking, lecture-note search.
+
+## Install (Windows 11)
+
+The twin is three parts: [Hermes Agent](https://github.com/NousResearch/hermes-agent) (the agent,
+Telegram bot and scheduler), this repo's MCP servers and scripts (run by Hermes), and the widget
+(an Electron app). Nothing needs administrator rights.
+
+### 1. Prerequisites
+
+- Python 3.12, Node.js 24, Git and Google Chrome.
+- An Anthropic API key, a Telegram bot token from [@BotFather](https://t.me/BotFather) and your
+  numeric Telegram user ID (from @userinfobot).
+- Your university's Moodle site, and a calendar holding your classes that can give a private iCal
+  address (Google Calendar does).
+
+### 2. Hermes Agent, at the pinned commit
+
+The twin is tested against Hermes commit `e3c3d27390`. Hermes's documented one-line installer always
+fetches the latest version, so download `install.ps1` from that commit instead, read it, and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -NonInteractive -SkipBrowser -SkipComputerUse
+hermes pm install --extra ddgs          # keyless web search
+hermes pm install --extra stt-whisper   # speech recognition for the widget
+```
+
+Set `HERMES_HOME` before installing to put Hermes on another drive.
+
+### 3. This repo
+
+```powershell
+git clone https://github.com/bdaikis/student-twin.git
+cd student-twin
+py -3.12 -m venv $env:USERPROFILE\.venvs\student-twin
+& $env:USERPROFILE\.venvs\student-twin\Scripts\python.exe -m pip install -r requirements.txt
+cd widget; npm install; cd ..
+```
+
+### 4. Your settings
+
+Copy `config.example.json` to `%LOCALAPPDATA%\student-twin\config.json` and fill it in: your Moodle
+site and courses, the semester's dates, your town (for the weather), the Chrome profile folder where
+you are signed in to Moodle (`chrome://version` shows it as "Profile Path"), folders the twin must
+never touch, and where course files go. Paths may use environment variables such as `%OneDrive%`.
+
+### 5. Secrets
+
+Each script asks with hidden prompts, checks the secret against its service, and never prints it.
+Run them yourself in a terminal, with the venv's Python:
+
+```powershell
+python scripts\setup_secrets.py        # Anthropic key, Telegram bot, your user ID, the widget's API key
+python scripts\save_calendar_link.py   # the private iCal address of your class calendar
+python scripts\save_portal_token.py    # your Moodle mobile token (it prints a sign-in link first)
+```
+
+The calendar address and the Moodle token go to Windows Credential Manager. The Anthropic key and the
+bot token go to Hermes's `.env` file for now, because Hermes on Windows reads secrets only from there.
+
+### 6. Connect the parts
+
+```powershell
+python scripts\setup_machine.py              # shows what it will write
+python scripts\setup_machine.py --apply      # Hermes's servers and settings, job launchers, jobs
+hermes gateway restart
+```
+
+`setup_machine.py` writes everything that holds this machine's paths, so the same repo works in any
+user folder. Add `--widget-autostart` to start the widget at sign-in, or `--jobs-paused` to create
+the scheduled jobs switched off (a second machine that should not send reminders yet).
+
+### 7. Start and check
+
+- Start the widget: `cd widget; npm start`. Hold the numpad `.` key and speak, or click it to type.
+- Send your bot a message on Telegram, then `/new` after any change to tools or settings.
+- Ask "what's due this week?" in both places.
+
+### Moving to another computer
+
+`scripts\transfer_state.py export <folder>` copies the twin's settings (shared rules, memory, the
+skills Hermes saved, `config.json`) without secrets; `import <folder>` puts them in place on the
+other machine. Add `--data` only at the moment of switching, after pausing the old machine's jobs,
+so that no reminder is sent twice. Only one machine may run the Telegram bot at a time.
 
 ## Privacy
 

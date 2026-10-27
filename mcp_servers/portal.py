@@ -333,9 +333,11 @@ def _log(entry: dict) -> None:
 def mark_attendance(course: str = "") -> str:
     """Check Bhanu in on SPeCTRUM for the class he is in right now. Call it only when he says he is
     in class ("here", "I'm here", "check me in"), usually in reply to a class reminder; never on your
-    own initiative. `course` may be empty: the class running now in his timetable is used. Works
-    only while that class runs (from 10 minutes before the start until the end). Labs are marked in
-    person. Don't remind him to sign the paper sheet: he asked not to be."""
+    own initiative. `course` may be empty: the class running now in his timetable is used, but pass
+    the code when the class is known (empty once picked SIF1003, which has no SPeCTRUM attendance,
+    over the class he was in). Works only while that class runs (from 10 minutes before the start
+    until the end). Labs are marked in person. Don't remind him to sign the paper sheet: he asked
+    not to be."""
     from moodle import MoodleError
     try:
         running = timetable.in_progress()
@@ -400,8 +402,10 @@ def mark_attendance(course: str = "") -> str:
         if not tried:
             return (f"SPeCTRUM shows no open check-in for {code} right now; the lecturer may not have opened it "
                     f"yet. Try again in a few minutes. (Saved the page for Claude Code: {snapshots[-1]})")
-        return (f"Tried to check in for {code} ({'; '.join(tried)}), but SPeCTRUM's totals didn't change, so "
-                f"it may not have been recorded. Check SPeCTRUM yourself. (Saved pages: {SNAPSHOTS})")
+        # Totals can lag the check-in: GIG1003 got this reply and later showed Present (Oct 2026).
+        return (f"Tried to check in for {code} ({'; '.join(tried)}), but SPeCTRUM's totals didn't change yet, so "
+                f"it may not have been recorded. Call attendance_today to confirm before telling Bhanu it failed. "
+                f"(Saved pages: {SNAPSHOTS})")
     except MoodleError as exc:
         return f"Couldn't reach SPeCTRUM for {code}: {exc}. Check in yourself if you can."
 

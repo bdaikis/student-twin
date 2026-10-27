@@ -708,6 +708,14 @@ def _protected() -> list[Path]:
 _SEARCH_ROOTS = ("downloads", "desktop", "documents", "pictures", "videos", "music")
 
 
+def _allowed_roots() -> list[Path]:
+    """Where the file tools may work: the user folder, plus the known folders wherever Windows keeps
+    them (on the desktop, Downloads is redirected to F:\\downloads folder; 2026-10-27). A known folder
+    redirected to a whole drive is left out, so a redirect never opens up a drive."""
+    known = [_known_folder(_KNOWN_FOLDERS[k]) for k in _SEARCH_ROOTS]
+    return [Path.home().resolve()] + [r.resolve() for r in known if r and r.resolve().parent != r.resolve()]
+
+
 def _folder_key(name: str) -> str:
     """"Twin Test folder", "twin-test" and "TwinTest" all give "twintest"."""
     key = re.sub(r"(?i)\s+folder$", "", name.strip())
@@ -751,7 +759,8 @@ def _find_named_folder(name: str, under: list[Path] | None = None) -> list[Path]
 
 
 def _resolve_folder(folder: str) -> Path | str:
-    """The folder as a resolved path inside Bhanu's user folder, or a refusal sentence. Besides the
+    """The folder as a resolved path inside Bhanu's user folder or one of his known folders
+    (_allowed_roots), or a refusal sentence. Besides the
     known folders and paths, a spoken folder name ("the Twin Test folder") is looked up by
     _find_named_folder; "Downloads/Twin Test" matches its last part inside Downloads."""
     name = folder.strip().strip('"')
@@ -777,10 +786,11 @@ def _resolve_folder(folder: str) -> Path | str:
         elif len(hits) > 1:
             return f"Several folders are called that: {'; '.join(str(h) for h in hits[:8])}. Say which."
     path = path.resolve()
-    home = Path.home().resolve()
-    if not path.is_relative_to(home):
-        return f"Refused: {path} is outside your user folder."
-    if any(part.startswith(".") for part in path.relative_to(home).parts):
+    root = next((r for r in _allowed_roots() if path.is_relative_to(r)), None)
+    if root is None:
+        return (f"Refused: {path} is outside your user folder and your Downloads, Desktop, Documents, "
+                "Pictures, Videos and Music folders.")
+    if any(part.startswith(".") for part in path.relative_to(root).parts):
         return f"Refused: {path} is a hidden settings folder."
     for p in _protected():
         if path.is_relative_to(p):
@@ -824,8 +834,9 @@ def _size(n: float) -> str:
 @server.tool()
 def list_files(folder: str, pattern: str = "*", recursive: bool = False, keep_searching: bool = False) -> str:
     """List files in a folder, newest first, with sizes and dates. `folder` is Downloads, Desktop,
-    Documents, Pictures, Videos, Music, a path inside Bhanu's user folder, or a folder's name as he
-    says it ("the twin test folder" finds Downloads\\twin-test). `pattern` is a wildcard such as
+    Documents, Pictures, Videos, Music, a path inside Bhanu's user folder or one of those folders
+    (wherever Windows keeps them), or a folder's name as he says it ("the twin test folder" finds
+    Downloads\\twin-test). `pattern` is a wildcard such as
     "*.zip" or "Screenshot*". Read-only. A recursive search stops after 5 seconds; if it does, ask
     Bhanu whether to keep searching, and only if he says yes call again with keep_searching=True
     (up to 2 minutes)."""

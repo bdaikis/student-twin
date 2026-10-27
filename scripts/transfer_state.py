@@ -6,7 +6,8 @@ and 2).
     python scripts\\transfer_state.py import <folder>          put a bundle in place on this machine
 
 Settings are Hermes's SOUL.md, memories\\MEMORY.md and the skills Hermes saved itself (any skill
-folder not in its .bundled_manifest), plus the twin's config.json. Live data is deadlines.db (form
+folder not in its .bundled_manifest), plus the twin's config.json and evals folder (the scored
+checks' questions, so they can run on the new machine). Live data is deadlines.db (form
 dates, dismissed items, which reminders were sent), reminders_state.json, attendance_seen.json,
 attendance_log.jsonl and attendance_snapshots: copy these only at the cutover, after the old
 machine's jobs are paused, so no reminder is sent twice. Secrets (.env, Credential Manager) are never
@@ -26,7 +27,8 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME") or LOCAL / "hermes")
 DATA = Path(os.environ.get("STUDENT_TWIN_HOME") or LOCAL / "student-twin")
 SETTINGS = {"hermes/SOUL.md": HERMES_HOME / "SOUL.md",
             "hermes/memories/MEMORY.md": HERMES_HOME / "memories" / "MEMORY.md",
-            "twin/config.json": DATA / "config.json"}
+            "twin/config.json": DATA / "config.json",
+            "twin/evals": DATA / "evals"}  # the scored checks' questions, scripts and past results
 LIVE = ["deadlines.db", "reminders_state.json", "attendance_seen.json", "attendance_log.jsonl", "attendance_snapshots"]
 
 

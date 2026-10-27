@@ -4,12 +4,13 @@ repo installs on any Windows user folder (phase 0 of the desktop host plan, 2026
 Run it with the twin's own Python, from the repo:
     <venv>\\Scripts\\python.exe scripts\\setup_machine.py            show what would change
     <venv>\\Scripts\\python.exe scripts\\setup_machine.py --apply    change it
-Options: --jobs-paused creates missing scheduled jobs switched off (a second machine before its
-cutover); --widget-autostart starts the widget at sign-in.
+Options: --jobs-paused creates missing scheduled jobs switched off and --telegram off keeps Hermes
+from polling the bot (both for a second machine before its cutover; --telegram on at the cutover);
+--widget-autostart starts the widget at sign-in.
 
 What it writes, each only when different from what is there:
 - Hermes's config.yaml: the `desktop` and `portal` MCP servers (this Python, this repo, this data
-  folder), the desktop and portal toolsets for the widget (api_server), CLI and Telegram, and the
+  folder), exactly the twin's toolsets for the widget (api_server), CLI and Telegram, and the
   Hermes defaults the twin changes (model, context window, no borrowed logins, no speech). Edited
   with Hermes's own ruamel.yaml, so the file's comments survive.
 - Launchers in Hermes's scripts folder for the three scheduled jobs (Hermes runs only scripts from
@@ -42,7 +43,13 @@ TOOLSETS = {"api_server": ["web", "memory", "skills", "todo", "desktop", "portal
 # borrow Claude Code's or Codex's logins (single-use refresh tokens, and usage would bill the
 # subscription); never speak replies.
 SETTINGS = {"model.default": "anthropic/claude-haiku-5.5", "model.provider": "anthropic",
-            "model.context_length": 1000000, "auth.adopt_external_logins": False, "voice.auto_tts": False}
+            "model.context_length": 1000000, "auth.adopt_external_logins": False, "voice.auto_tts": False,
+            # Speech on the CPU: the GPU path needs NVIDIA's cublas64_12.dll, and without it a first
+            # transcription on the desktop's GTX 1080 Ti hung rather than failing (2026-10-27).
+            "stt.local.device": "cpu", "stt.local.compute_type": "int8"}
+# A fresh Hermes config points model.base_url at OpenRouter. With the anthropic provider the calls
+# still go to api.anthropic.com, but the leftover address makes Hermes drop the context_length pin.
+REMOVE = ["model.base_url"]
 JOBS = [  # name, schedule, script, what it is
     ("class-reminders", "every 5m", "class_reminders.py", "class start reminders and attendance follow-ups"),
     ("digest", "0 7,21 * * *", "digest.py", "the twice-daily digest"),
@@ -76,12 +83,20 @@ for dotted, value in req["settings"].items():
         node = node.setdefault(part, {})
     if node.get(leaf) != value:
         node[leaf] = value; changed.append(dotted)
+for dotted in req["remove"]:
+    node, *parents, leaf = [doc, *dotted.split(".")]
+    for part in parents:
+        node = node.get(part) or {}
+    if leaf in node:
+        del node[leaf]; changed.append(f"{dotted} (removed)")
+# Exactly the twin's toolsets: a fresh Hermes gives each channel a broad default (hermes-telegram
+# includes the terminal, file tools and send_message), which adding to would keep.
 toolsets = doc.setdefault("platform_toolsets", {})
 for platform, want in req["toolsets"].items():
     have = list(toolsets.get(platform) or [])
-    missing = [t for t in want if t not in have]
-    if missing:
-        toolsets[platform] = have + missing; changed.append(f"platform_toolsets.{platform} (+{', '.join(missing)})")
+    if set(have) != set(want):
+        toolsets[platform] = want
+        changed.append(f"platform_toolsets.{platform} ({', '.join(have) or 'default'} -> {', '.join(want)})")
 if changed and req["apply"]:
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(doc, f)
@@ -98,15 +113,19 @@ def hermes_python() -> Path:
     return Path(venv) / "Scripts" / "python.exe"
 
 
-def hermes_config(apply: bool) -> list[str]:
+def hermes_config(apply: bool, telegram: str | None) -> list[str]:
     # Hermes passes its servers only these variables; OneDrive's is needed for "%OneDrive%" paths in
-    # the twin's config (common.expand_path also reads it from the registry when missing).
+    # the twin's config (common.expand_path also reads it from the registry when missing), and
+    # HERMES_HOME for send_screenshot when Hermes is installed outside %LOCALAPPDATA%.
     env = {"STUDENT_TWIN_HOME": str(DATA), "LOCALAPPDATA": str(LOCAL)}
-    env.update({v: os.environ[v] for v in ("OneDrive", "OneDriveConsumer") if os.environ.get(v)})
+    env.update({v: os.environ[v] for v in ("OneDrive", "OneDriveConsumer", "HERMES_HOME") if os.environ.get(v)})
     servers = {name: {"command": str(PYTHON), "args": [str(REPO / "mcp_servers" / f"{name}.py")],
                       "env": env, "enabled": True} for name in SERVERS}
+    settings = dict(SETTINGS)
+    if telegram:  # an explicit platforms.telegram.enabled wins over the bot token in .env
+        settings["platforms.telegram.enabled"] = telegram == "on"
     req = {"path": str(HERMES_HOME / "config.yaml"), "servers": servers, "toolsets": TOOLSETS,
-           "settings": SETTINGS, "apply": apply}
+           "settings": settings, "remove": REMOVE, "apply": apply}
     out = subprocess.run([str(hermes_python()), "-c", _YAML_EDIT], input=json.dumps(req), capture_output=True,
                          text=True, encoding="utf-8")
     if out.returncode:
@@ -176,6 +195,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--apply", action="store_true", help="make the changes (default: only show them)")
     ap.add_argument("--jobs-paused", action="store_true", help="create missing scheduled jobs switched off")
+    ap.add_argument("--telegram", choices=["on", "off"],
+                    help="off: Hermes doesn't poll the bot (a second machine before its cutover); on: it does")
     ap.add_argument("--widget-autostart", action="store_true", help="start the widget at sign-in")
     args = ap.parse_args()
     try:
@@ -184,14 +205,14 @@ def main() -> None:
         sys.exit(f"{PYTHON} lacks the twin's packages; run this with the twin's venv Python "
                  "(pip install -r requirements.txt first).")
     print(f"Repo {REPO}\nPython {PYTHON}\nHermes {HERMES_HOME}\nData {DATA}\n")
-    changes = hermes_config(args.apply) + launchers(args.apply) + jobs(args.apply, args.jobs_paused)
+    changes = hermes_config(args.apply, args.telegram) + launchers(args.apply) + jobs(args.apply, args.jobs_paused)
     if args.widget_autostart:
         changes += widget_autostart(args.apply)
     if not changes:
         print("Nothing to change: this machine's setup matches the repo.")
         return
     print(("Changed:" if args.apply else "Would change (run with --apply):") + "".join(f"\n- {c}" for c in changes))
-    if args.apply and any(c.startswith("mcp_servers") or c.startswith("platform_toolsets") for c in changes):
+    if args.apply and any(c.startswith(("mcp_servers", "platform_toolsets", "platforms.")) for c in changes):
         print("\nRestart Hermes so it loads them: hermes gateway restart")
 
 

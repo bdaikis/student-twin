@@ -43,15 +43,19 @@ Telegram bot and scheduler), this repo's MCP servers and scripts (run by Hermes)
 ### 2. Hermes Agent, at the pinned commit
 
 The twin is tested against Hermes commit `e3c3d27390`. Hermes's documented one-line installer always
-fetches the latest version, so download `install.ps1` from that commit instead, read it, and run:
+fetches the latest version, so download `install.ps1` from that commit instead, read it, and run it
+with `-Commit`: without it, even this installer checks out the newest `main`.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File install.ps1 -NonInteractive -SkipBrowser -SkipComputerUse
+$hermes = "e3c3d273901894ea98aee33f1fa20f3b460ba2dc"
+Invoke-WebRequest "https://raw.githubusercontent.com/NousResearch/hermes-agent/$hermes/scripts/install.ps1" -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File install.ps1 -Commit $hermes -NonInteractive -SkipBrowser -SkipComputerUse
 hermes pm install --extra ddgs          # keyless web search
 hermes pm install --extra stt-whisper   # speech recognition for the widget
 ```
 
-Set `HERMES_HOME` before installing to put Hermes on another drive.
+Open a new terminal afterwards so `hermes` is on the PATH. Set `HERMES_HOME` before installing to put
+Hermes on another drive.
 
 ### 3. This repo
 
@@ -60,8 +64,11 @@ git clone https://github.com/bdaikis/student-twin.git
 cd student-twin
 py -3.12 -m venv $env:USERPROFILE\.venvs\student-twin
 & $env:USERPROFILE\.venvs\student-twin\Scripts\python.exe -m pip install -r requirements.txt
-cd widget; npm install; cd ..
+cd widget; npm install; node node_modules/electron/install.js; cd ..
 ```
+
+`npm install` leaves out Electron's own program; `install.js` downloads it
+(`widget\node_modules\electron\dist\electron.exe`).
 
 ### 4. Your settings
 
@@ -93,8 +100,11 @@ hermes gateway restart
 ```
 
 `setup_machine.py` writes everything that holds this machine's paths, so the same repo works in any
-user folder. Add `--widget-autostart` to start the widget at sign-in, or `--jobs-paused` to create
-the scheduled jobs switched off (a second machine that should not send reminders yet).
+user folder. Add `--widget-autostart` to start the widget at sign-in.
+
+On a second machine while the first still runs the twin, add `--jobs-paused --telegram off` before
+starting Hermes there: the jobs are created switched off, and Hermes doesn't poll the bot (two
+machines polling one bot split its messages between them, and both would send every reminder).
 
 ### 7. Start and check
 
@@ -107,7 +117,9 @@ the scheduled jobs switched off (a second machine that should not send reminders
 `scripts\transfer_state.py export <folder>` copies the twin's settings (shared rules, memory, the
 skills Hermes saved, `config.json`) without secrets; `import <folder>` puts them in place on the
 other machine. Add `--data` only at the moment of switching, after pausing the old machine's jobs,
-so that no reminder is sent twice. Only one machine may run the Telegram bot at a time.
+so that no reminder is sent twice. Only one machine may run the Telegram bot at a time: stop Hermes
+on the old machine first, then run `setup_machine.py --apply --telegram on` on the new one, resume
+its jobs and restart Hermes there.
 
 ## Privacy
 

@@ -75,7 +75,8 @@ cd widget; npm install; node node_modules/electron/install.js; cd ..
 Copy `config.example.json` to `%LOCALAPPDATA%\student-twin\config.json` and fill it in: your Moodle
 site and courses, the semester's dates, your town (for the weather), the Chrome profile folder where
 you are signed in to Moodle (`chrome://version` shows it as "Profile Path"), folders the twin must
-never touch, and where course files go. Paths may use environment variables such as `%OneDrive%`.
+never touch, where course files go, and the words speech recognition should expect (`voice.vocabulary`:
+your course codes and the apps you name). Paths may use environment variables such as `%OneDrive%`.
 
 ### 5. Secrets
 

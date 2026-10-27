@@ -11,7 +11,8 @@ from polling the bot (both for a second machine before its cutover; --telegram o
 What it writes, each only when different from what is there:
 - Hermes's config.yaml: the `desktop` and `portal` MCP servers (this Python, this repo, this data
   folder), exactly the twin's toolsets for the widget (api_server), CLI and Telegram, and the
-  Hermes defaults the twin changes (model, context window, no borrowed logins, no speech). Edited
+  Hermes defaults the twin changes (model, context window, no borrowed logins, no speech, speech
+  recognition on the CPU), and Whisper's vocabulary hint from config.json's voice.vocabulary. Edited
   with Hermes's own ruamel.yaml, so the file's comments survive.
 - Launchers in Hermes's scripts folder for the three scheduled jobs (Hermes runs only scripts from
   there), pointing at this repo.
@@ -122,6 +123,13 @@ def hermes_config(apply: bool, telegram: str | None) -> list[str]:
     servers = {name: {"command": str(PYTHON), "args": [str(REPO / "mcp_servers" / f"{name}.py")],
                       "env": env, "enabled": True} for name in SERVERS}
     settings = dict(SETTINGS)
+    # Whisper's vocabulary hint (app names, course codes, command verbs) is personal, so it lives in
+    # the twin's config.json, which transfer_state.py carries, not in this repo.
+    config = DATA / "config.json"
+    vocabulary = (json.loads(config.read_text(encoding="utf-8-sig")).get("voice", {}).get("vocabulary")
+                  if config.exists() else None)
+    if vocabulary:
+        settings["stt.prompt"] = vocabulary
     if telegram:  # an explicit platforms.telegram.enabled wins over the bot token in .env
         settings["platforms.telegram.enabled"] = telegram == "on"
     req = {"path": str(HERMES_HOME / "config.yaml"), "servers": servers, "toolsets": TOOLSETS,

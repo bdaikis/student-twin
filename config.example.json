@@ -29,5 +29,8 @@
     "course_folders": {"ABC1001": "Example Course One"},
     "skip_courses": []
   },
-  "voice": {"keep_recordings": false}
+  "voice": {
+    "keep_recordings": false,
+    "vocabulary": "Voice commands to my assistant: open, close, minimize, maximize, focus, play, pause. Spotify, VS Code, Chrome, Moodle. Courses ABC1001, ABC1002; Lecture 1, Tutorial 2."
+  }
 }

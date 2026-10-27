@@ -7,9 +7,12 @@ deadlines that come from course forms or that Bhanu added (the portal doesn't ha
 Questions live in the per-user data folder (<data>/evals/deadline_questions.json), since they name
 his courses. Each is asked in a fresh Hermes session with no hints, as Telegram would ask it:
   {"q": "...", "type": "items", "days": 7}               every item due in the next N days is named with its date
+  {"q": "...", "type": "next"}                           the soonest unsubmitted item still to come is named with its date
   {"q": "...", "type": "item", "course": "X", "title": "Y"}  that item is named with its date
   {"q": "...", "type": "overdue"}                        every overdue unsubmitted assignment or quiz is named
-  {"q": "...", "type": "none"}                           the answer says there's nothing, and names no date
+  {"q": "...", "type": "none"}                           the answer says there's nothing, and names no made-up date
+The run refuses to start while an item question is stale (its item is one the twin hides: done and
+closed, or due over 14 days ago), so a pass is about deadlines as they stand that day.
 Results are printed and saved to <data>/evals/.
 """
 import json
@@ -91,19 +94,29 @@ def _dates(text: str, year: int):
 def score(q: dict, answer: str, items: list[dict], now: int) -> tuple[bool, str]:
     t = q["type"]
     if t == "none":
-        # Only a future date counts as inventing a deadline ("as of Tue 20 Oct" or a past item is fine).
+        # A future date counts as inventing a deadline unless it's the date of a real item the answer
+        # names ("no SIF1017 exam; Tutorial 1 is due 2 Nov" is right). "As of Tue 20 Oct" or a past item is fine.
         today = datetime.fromtimestamp(now, timetable.LOCAL).date()
-        dated = any(d > today for d in _dates(answer, today.year))
+        real = {datetime.fromtimestamp(i["due"], timetable.LOCAL).date() for i in items if mentions(answer, i)}
+        dated = any(d > today and d not in real for d in _dates(answer, today.year))
         nothing = re.search(r"(?i)\bno(thing| deadlines?| assignments?| tests?)?\b|isn't|aren't|don't see|not (find|listed|on)", answer)
         return bool(nothing) and not dated, "says nothing, no dates" if nothing and not dated else "named a date or didn't say none"
     if t == "items":
         want = [i for i in items if now <= i["due"] <= now + q.get("days", 7) * 86400 and not i["done"]]
     elif t == "overdue":
         want = [i for i in items if i["due"] < now and not i["done"] and i["kind"] in ("assignment", "quiz")]
+    elif t == "next":
+        ahead = [i for i in items if i["due"] >= now and not i["done"]]
+        first = min((i["due"] for i in ahead), default=None)
+        want = [i for i in ahead if i["due"] == first]
     else:
         want = [i for i in items if i["course"] == q["course"] and q["title"].lower() in i["title"].lower()]
+        # deadlines.upcoming() hides these, so the twin can't know them: replace the question.
+        if want and all(i["due"] < now - 14 * 86400 or (i["due"] < now and i["done"]) for i in want):
+            return False, "stale: the twin hides this item now (closed and done, or over 14 days ago)"
     missed = [f"{i['course']} {i['title']}" for i in want if not mentions(answer, i)]
-    return not missed and bool(want), (f"missed: {'; '.join(missed)}" if missed else f"all {len(want)} named")
+    return not missed and bool(want), (f"missed: {'; '.join(missed)}" if missed
+                                       else f"all {len(want)} named" if want else "not in the key")
 
 
 def main() -> None:
@@ -111,6 +124,9 @@ def main() -> None:
     questions = json.loads(qfile.read_text(encoding="utf-8"))
     now = int(time.time())
     items = key_items(now)
+    stale = [q["q"] for q in questions if score(q, "", items, now)[1].startswith("stale")]
+    if stale:
+        sys.exit("Stale questions; replace them with items still to come, then rerun:\n  " + "\n  ".join(stale))
     results = []
     for q in questions:
         t0 = time.time()

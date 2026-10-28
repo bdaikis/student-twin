@@ -1,6 +1,6 @@
 // Widget renderer. One shape at a time: a pill (rest, listening, transcribing, working, success)
-// or a card (answer, error, confirm, typing); the window is sized to it (Ghost Overlay UI
-// Redesign, 2026-10-18). Typed and spoken requests go to the twin (Hermes) and answers stream
+// or a card (answer, error, confirm, typing, settings); the window is sized to it (Ghost Overlay
+// UI Redesign, 2026-10-18). Typed and spoken requests go to the twin (Hermes) and answers stream
 // back; the confirm card guards irreversible tools.
 const shell = document.getElementById('shell');
 const inner = document.getElementById('inner');
@@ -11,10 +11,11 @@ const body = document.getElementById('body');
 const confirmBox = document.getElementById('confirm');
 const input = document.getElementById('input');
 
-const CARD_VIEWS = new Set(['answer', 'error', 'confirm', 'typing']);
+const CARD_VIEWS = new Set(['answer', 'error', 'confirm', 'typing', 'settings']);
 const LABELS = {
   rest: 'Idle', listening: 'Listening', transcribing: 'Transcribing', working: 'Working',
   success: 'Done', answer: 'Answer', error: 'Problem', confirm: 'Waiting for you', typing: 'Typing',
+  settings: 'Settings',
 };
 const SUCCESS_MS = 900;
 const ERROR_MS = 12000;
@@ -27,6 +28,7 @@ let viewTimer = null; // collapse timer for success, answer, error and settled c
 let timerLeft = 0;
 let timerStarted = 0;
 let hovering = false;
+let capturing = false; // the settings card is waiting for a new talk key or button
 
 // ---- Layout: measure the shape, size the window to it, then animate the shell --------------
 // Growing: enlarge the window first (the new area is transparent), then morph the shell.
@@ -82,6 +84,8 @@ new ResizeObserver(queueLayout).observe(inner);
 
 // ---- Views ----------------------------------------------------------------------------------
 function setView(name) {
+  // Leaving settings mid-capture must stop it, or the next key typed elsewhere would be taken.
+  if (capturing && name !== 'settings') { capturing = false; window.twin.captureTalk(false); }
   clearTimer();
   hovering = false; // counts again from the next pointer move
   view = name;
@@ -207,6 +211,7 @@ window.twin.onDelta(({ id, text }) => {
   a.text += text;
   // Hold back a reply that is still only the done mark, so it never flashes up as text.
   if (isHeldBack(a.text) || id !== current || confirms.size || a.interrupted || a.dismissed || a.confirmCancelled) return;
+  if (view === 'settings') return; // the answer can be reopened from the dot afterwards
   showAnswer(a, true);
 });
 
@@ -237,14 +242,14 @@ window.twin.onDone(({ id, cancelled }) => {
     if (view === 'working') setView('rest');
   } else if (isDoneMark(a.text)) {
     last = { request: a.request, kind: 'done', text: '', at: Date.now() };
-    if (confirms.size || view === 'listening' || view === 'typing') return;
+    if (confirms.size || view === 'listening' || view === 'typing' || view === 'settings') return;
     setView('success');
     collapseIn(SUCCESS_MS);
   } else if (!a.text.trim()) {
     if (view === 'working') setView('rest');
   } else {
     last = { request: a.request, kind: 'answer', text: a.text, at: Date.now() };
-    if (confirms.size || view === 'listening' || view === 'typing') return;
+    if (confirms.size || view === 'listening' || view === 'typing' || view === 'settings') return;
     showAnswer(a, false);
     collapseIn(readingTime(a.text));
   }
@@ -254,7 +259,7 @@ window.twin.onError(({ id, message }) => {
   const a = answers.get(id);
   answers.delete(id);
   if (id === current) current = null;
-  if (a && !a.interrupted && view !== 'listening' && view !== 'typing') showError(message, a.request);
+  if (a && !a.interrupted && view !== 'listening' && view !== 'typing' && view !== 'settings') showError(message, a.request);
 });
 
 function stopCurrent() {
@@ -263,6 +268,7 @@ function stopCurrent() {
 
 // Closing a card while its answer still streams stops the answer and drops it.
 document.getElementById('close').addEventListener('click', () => {
+  if (view === 'settings') { setView(current ? 'working' : 'rest'); return; }
   const a = current && answers.get(current);
   if (a) { a.dismissed = true; stopCurrent(); }
   setView('rest');
@@ -408,7 +414,7 @@ window.twin.onFocusLost(() => { if (view === 'typing') setView(current ? 'workin
 // On press, not click: a press on a pill that appeared under a still cursor makes it widen for
 // hover, and the window resize between press and release would cancel the click.
 pill.addEventListener('pointerdown', (e) => {
-  if (e.button !== 0 || e.target.closest('.chev, .grip')) return;
+  if (e.button !== 0 || e.target.closest('.chev, .grip, .gear')) return;
   if (view === 'rest') openTyping();
 });
 
@@ -484,6 +490,112 @@ window.twin.onOnline((ok) => {
   if (view === 'rest') setView('rest');
 });
 
+// ---- Settings (the gear beside the grip, 2026-10-28) ----------------------------------------------
+// Per machine: the key or mouse side button held to talk, the hold time, the microphone, and start
+// with Windows. The main process keeps them in <data>/widget.json and passes the talk key to the
+// voice helper. The card works by mouse alone: the window never takes focus for it, and a new talk
+// key is read by the helper's hook (Esc cancels), not by the page.
+const talkBtn = document.getElementById('talk-key');
+const talkHint = document.getElementById('talk-hint');
+const holdInput = document.getElementById('hold');
+const holdVal = document.getElementById('hold-val');
+const micList = document.getElementById('mics');
+const autostart = document.getElementById('autostart');
+let prefs = null; // the settings as the main process last returned them
+let micDevice = null; // the chosen microphone's current device id, or null for Windows' default
+
+const seconds = (ms) => `${(ms / 1000).toFixed(2)} s`;
+
+function showPrefs() {
+  talkBtn.textContent = capturing ? 'Press a key or side button' : prefs.talk.name;
+  talkBtn.classList.toggle('capturing', capturing);
+  talkHint.textContent = capturing ? 'Esc, or a click on the button, cancels' : '';
+  holdInput.value = prefs.hold_ms;
+  holdVal.textContent = seconds(prefs.hold_ms);
+  autostart.setAttribute('aria-checked', String(Boolean(prefs.start_with_windows)));
+}
+
+async function listMics() {
+  try {
+    // "default" and "communications" are Windows' aliases for real devices that are listed anyway.
+    return (await navigator.mediaDevices.enumerateDevices())
+      .filter((d) => d.kind === 'audioinput' && d.deviceId !== 'default' && d.deviceId !== 'communications');
+  } catch { return []; }
+}
+
+// A saved microphone is found again by its id, or by its name if Windows gave it a new id.
+function findMic(devices) {
+  const m = prefs && prefs.microphone;
+  return m ? devices.find((d) => d.deviceId === m.id) || devices.find((d) => d.label && d.label === m.label) : null;
+}
+
+async function resolveMic() { micDevice = findMic(await listMics())?.deviceId || null; }
+
+async function showMics() {
+  const devices = await listMics();
+  const chosen = findMic(devices);
+  const option = (label, mic, { checked, disabled = false }) => {
+    const b = document.createElement('button');
+    b.setAttribute('role', 'radio');
+    b.setAttribute('aria-checked', String(checked));
+    b.disabled = disabled;
+    b.textContent = label;
+    b.onclick = async () => {
+      prefs = await window.twin.setSettings({ microphone: mic ? { id: mic.deviceId, label: mic.label } : null });
+      await resolveMic();
+      showMics();
+    };
+    return b;
+  };
+  // Chromium appends the USB ids to a label: "Microphone (Logitech BRIO) (046d:085e)".
+  const named = (d, i) => (d.label || `Microphone ${i + 1}`).replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)$/i, '');
+  const rows = [option('Windows default', null, { checked: !prefs.microphone })];
+  devices.forEach((d, i) => rows.push(option(named(d, i), d, { checked: chosen === d })));
+  // Unplugged: keep the choice on show; until it's back, Windows' default is used.
+  if (prefs.microphone && !chosen) rows.push(option(`${prefs.microphone.label || 'Saved microphone'} (not connected)`, null, { checked: true, disabled: true }));
+  micList.replaceChildren(...rows);
+}
+
+async function openSettings() {
+  if (confirms.size) return;
+  prefs = await window.twin.getSettings();
+  showPrefs();
+  await showMics();
+  setView('settings');
+}
+
+document.getElementById('gear').addEventListener('pointerdown', (e) => {
+  if (e.button === 0 && view === 'rest') openSettings();
+});
+
+talkBtn.addEventListener('click', () => {
+  capturing = !capturing;
+  window.twin.captureTalk(capturing);
+  showPrefs();
+});
+window.twin.onCaptured(({ talk }) => {
+  capturing = false;
+  if (talk && prefs) prefs.talk = talk;
+  if (view === 'settings') showPrefs();
+});
+
+holdInput.addEventListener('input', () => { holdVal.textContent = seconds(Number(holdInput.value)); });
+holdInput.addEventListener('change', async () => {
+  prefs = await window.twin.setSettings({ hold_ms: Number(holdInput.value) });
+  showPrefs();
+});
+
+autostart.addEventListener('click', async () => {
+  prefs = await window.twin.setSettings({ start_with_windows: !prefs.start_with_windows });
+  showPrefs();
+});
+
+navigator.mediaDevices.addEventListener('devicechange', () => {
+  resolveMic();
+  if (view === 'settings') showMics();
+});
+window.twin.getSettings().then((s) => { prefs = s; resolveMic(); });
+
 // ---- Push-to-talk microphone (step 2c) ------------------------------------------------------
 // The mic opens on key press (so the first word isn't clipped while a tap is told apart from a
 // hold) and is fully released on key up or tap. Audio goes to the main process as a 16 kHz WAV
@@ -494,9 +606,13 @@ const mic = { stream: null, ctx: null, proc: null, analyser: null, chunks: [], o
 async function micOpen() {
   if (mic.stream || mic.opening) return mic.opening;
   mic.opening = (async () => {
-    mic.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
+    const audio = { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+    try {
+      mic.stream = await navigator.mediaDevices.getUserMedia({ audio: micDevice ? { ...audio, deviceId: { exact: micDevice } } : audio });
+    } catch (err) {
+      if (!micDevice) throw err;
+      mic.stream = await navigator.mediaDevices.getUserMedia({ audio }); // the chosen mic went away: Windows' default
+    }
     mic.ctx = new AudioContext();
     const src = mic.ctx.createMediaStreamSource(mic.stream);
     mic.analyser = mic.ctx.createAnalyser();

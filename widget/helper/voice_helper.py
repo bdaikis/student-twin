@@ -1,4 +1,4 @@
-"""Student Twin voice helper: numpad push-to-talk hook + local transcription.
+"""Student Twin voice helper: push-to-talk hook + local transcription.
 
 Run by the widget with Hermes's Python (so faster-whisper comes from Hermes's own environment).
 Protocol: JSON lines. Commands on stdin, events on stdout.
@@ -6,18 +6,25 @@ Protocol: JSON lines. Commands on stdin, events on stdout.
   events:   {"event": "ready"} | {"event": "press"} | {"event": "hold"} | {"event": "release"}
             {"event": "fullscreen", "busy": true|false} (a full-screen app is in front, or not)
             {"event": "tap"} | {"event": "transcript", "id", "ok", "text", "error", "ms"}
+            {"event": "captured", "talk": {...}} | {"event": "captured", "cancelled": true}
             {"event": "log", "message"}
   commands: {"cmd": "transcribe", "id": "...", "path": "C:/...wav"} | {"cmd": "restore_focus"}
+            {"cmd": "configure", "talk": {...}, "hold_ms": 300} | {"cmd": "capture", "cancel"?: true}
             {"cmd": "quit"}
 
 restore_focus gives the keyboard back to the app that was in front before the widget took focus
 for typing. Electron can only blur its window, which hands focus to whatever Windows picks (often
 the desktop), so this process tracks the last foreground window that isn't the widget's.
 
-Push-to-talk follows wiki/projects/student-twin/voice-widget-spec.md v0.6, section 3: the numpad
-'.'/'Del' key (scan code 0x53, NOT extended) is held back on press; released before the threshold it
-is re-sent as a normal tap; held past it, it means "talk". The main Delete key (0x53 + extended flag)
-and the key pressed with any modifier are never touched.
+Push-to-talk follows wiki/projects/student-twin/voice-widget-spec.md, section 3. The talk key is
+set in the widget's settings (per machine, <data>/widget.json) and arrives in STUDENT_TWIN_VOICE at
+start and in "configure" afterwards:
+  {"device": "key", "scan": 83, "extended": false}   a keyboard key, by scan code and extended flag
+  {"device": "mouse", "button": 1}                    a mouse side button (1 = back, 2 = forward)
+The default is the numpad '.'/'Del' key (scan code 0x53, NOT extended; the main Delete key is 0x53
+with the extended flag). The press is held back; released before the hold time it is re-sent as a
+normal tap; held past it, it means "talk". A press made with any modifier down is never touched.
+"capture" reports the next key or side button pressed (Esc cancels) instead of acting on it.
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -28,8 +35,8 @@ import sys
 import threading
 import time
 
-HOLD_THRESHOLD_S = 0.30
-TARGET_SCAN = 0x53
+NUMPAD_DOT = {"device": "key", "scan": 0x53, "extended": False}
+CAPTURE_TIMEOUT_S = 15
 
 # The protocol owns the real stdout; anything else that prints (Hermes logging) goes to stderr.
 _protocol = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
@@ -53,16 +60,26 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 LRESULT = ctypes.c_ssize_t
-WH_KEYBOARD_LL = 13
+WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
+WM_QUIT = 0x0012
 WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0100, 0x0101, 0x0104, 0x0105
+WM_XBUTTONDOWN, WM_XBUTTONUP = 0x020B, 0x020C
 LLKHF_EXTENDED, LLKHF_INJECTED = 0x01, 0x10
+LLMHF_INJECTED = 0x01
 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x0001, 0x0002
-INPUT_KEYBOARD = 1
-VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN = 0x10, 0x11, 0x12, 0x5B, 0x5C
+MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP = 0x0080, 0x0100
+INPUT_MOUSE, INPUT_KEYBOARD = 0, 1
+VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_ESCAPE = 0x10, 0x11, 0x12, 0x5B, 0x5C, 0x1B
+SIDE_BUTTONS = {1: "Mouse back button", 2: "Mouse forward button"}
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD), ("flags", wt.DWORD),
+                ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wt.POINT), ("mouseData", wt.DWORD), ("flags", wt.DWORD),
                 ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
 
 
@@ -96,6 +113,9 @@ user32.CallNextHookEx.restype = LRESULT
 user32.SendInput.argtypes = [wt.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.GetKeyNameTextW.argtypes = [wt.LONG, wt.LPWSTR, ctypes.c_int]
+user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+user32.PostThreadMessageW.argtypes = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
 kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wt.HMODULE
 
@@ -103,6 +123,31 @@ kernel32.GetModuleHandleW.restype = wt.HMODULE
 def _key(vk, scan, up=False, extended=False):
     flags = (KEYEVENTF_KEYUP if up else 0) | (KEYEVENTF_EXTENDEDKEY if extended else 0)
     return INPUT(type=INPUT_KEYBOARD, u=_INPUTUNION(ki=KEYBDINPUT(wVk=vk, wScan=scan, dwFlags=flags)))
+
+
+def _side_button(button, up=False):
+    flags = MOUSEEVENTF_XUP if up else MOUSEEVENTF_XDOWN
+    return INPUT(type=INPUT_MOUSE, u=_INPUTUNION(mi=MOUSEINPUT(mouseData=button, dwFlags=flags)))
+
+
+def key_name(scan, extended):
+    """What Windows calls the key on this keyboard layout ("Right Alt", "Insert", ...)."""
+    if scan == 0x53 and not extended:
+        return "Numpad ."
+    buf = ctypes.create_unicode_buffer(64)
+    n = user32.GetKeyNameTextW(((scan & 0xFF) << 16) | (1 << 24 if extended else 0), buf, 64)
+    return buf.value[:n] if n else f"Key {scan:#04x}"
+
+
+def valid_talk(talk):
+    """The binding if it is well formed, else None."""
+    if not isinstance(talk, dict):
+        return None
+    if talk.get("device") == "mouse" and talk.get("button") in SIDE_BUTTONS:
+        return {"device": "mouse", "button": talk["button"]}
+    if talk.get("device") == "key" and isinstance(talk.get("scan"), int) and 0 < talk["scan"] < 0x100:
+        return {"device": "key", "scan": talk["scan"], "extended": bool(talk.get("extended"))}
+    return None
 
 
 def send_keys(*inputs):
@@ -123,6 +168,54 @@ class PushToTalk:
         self.vk = 0
         self.lock = threading.Lock()
         self.timer = None
+        self.talk = dict(NUMPAD_DOT)
+        self.hold_s = 0.30
+        self.capturing = None  # the capture's timeout timer while waiting for a key or button
+        self.swallow_up = None  # the captured key or button, whose release must not reach the app
+
+    def configure(self, talk=None, hold_ms=None):
+        with self.lock:
+            if self.timer:
+                self.timer.cancel()
+            self.state = self.IDLE
+            self.talk = valid_talk(talk) or self.talk
+            if isinstance(hold_ms, (int, float)) and 100 <= hold_ms <= 2000:
+                self.hold_s = hold_ms / 1000
+
+    def wants_mouse(self):
+        return self.talk["device"] == "mouse" or self.capturing is not None
+
+    def capture(self):
+        with self.lock:
+            if self.capturing:
+                self.capturing.cancel()
+            self.capturing = threading.Timer(CAPTURE_TIMEOUT_S, self._capture_timeout)
+            self.capturing.start()
+
+    def _capture_timeout(self):
+        with self.lock:
+            if self.capturing:
+                self.capturing = None
+                emit(event="captured", cancelled=True)
+
+    def cancel_capture(self):
+        with self.lock:
+            if self.capturing:
+                self.capturing.cancel()
+                self.capturing = None
+                emit(event="captured", cancelled=True)
+
+    def _captured(self, talk, swallow):
+        """Under the lock: report what was pressed; its release is swallowed too."""
+        self.capturing.cancel()
+        self.capturing = None
+        self.swallow_up = swallow
+        if talk is None:
+            emit(event="captured", cancelled=True)
+        else:
+            name = SIDE_BUTTONS[talk["button"]] if talk["device"] == "mouse" else key_name(talk["scan"], talk["extended"])
+            emit(event="captured", talk={**talk, "name": name})
+        return True
 
     def _threshold(self):
         with self.lock:
@@ -130,51 +223,97 @@ class PushToTalk:
                 self.state = self.HOLDING
                 emit(event="hold")
 
+    def _target_down(self, vk=0):
+        """Under the lock: the talk key or button went down. Returns True to swallow it."""
+        if self.state == self.IDLE:
+            if modifier_down():
+                self.state = self.PASSTHROUGH  # a shortcut, not push-to-talk
+                return False
+            self.state, self.vk = self.PENDING, vk
+            self.timer = threading.Timer(self.hold_s, self._threshold)
+            self.timer.start()
+            emit(event="press")
+            return True
+        return self.state != self.PASSTHROUGH  # swallow key-repeat while pending/holding
+
+    def _target_up(self, resend_tap):
+        state, self.state = self.state, self.IDLE
+        if state == self.PENDING:
+            self.timer.cancel()
+            send_keys(*resend_tap)
+            emit(event="tap")
+            return True
+        if state == self.HOLDING:
+            emit(event="release")
+            return True
+        return False  # PASSTHROUGH (or stray up): let it through
+
     def handle(self, msg, kb):
-        """Return True to swallow the event. Must stay fast: Windows drops slow hooks."""
+        """Keyboard events. Return True to swallow the event. Must stay fast: Windows drops slow hooks."""
         if kb.flags & LLKHF_INJECTED:
             return False  # our own re-sent keys (and other software's) pass through
-        is_target = kb.scanCode == TARGET_SCAN and not (kb.flags & LLKHF_EXTENDED)
+        ext = bool(kb.flags & LLKHF_EXTENDED)
         down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
         with self.lock:
-            if is_target:
+            if self.capturing and down:
+                if kb.vkCode == VK_ESCAPE:
+                    return self._captured(None, ("key", kb.scanCode, ext))
+                return self._captured({"device": "key", "scan": kb.scanCode, "extended": ext}, ("key", kb.scanCode, ext))
+            if self.swallow_up == ("key", kb.scanCode, ext):
+                if not down:
+                    self.swallow_up = None
+                return True
+            talk = self.talk
+            if talk["device"] != "key":
+                return False
+            scan, t_ext = talk["scan"], talk["extended"]
+            if kb.scanCode == scan and ext == t_ext:
                 if down:
-                    if self.state == self.IDLE:
-                        if modifier_down():
-                            self.state = self.PASSTHROUGH  # a shortcut, not push-to-talk
-                            return False
-                        self.state, self.vk = self.PENDING, kb.vkCode
-                        self.timer = threading.Timer(HOLD_THRESHOLD_S, self._threshold)
-                        self.timer.start()
-                        emit(event="press")
-                        return True
-                    return self.state != self.PASSTHROUGH  # swallow key-repeat while pending/holding
-                # key up
-                state, self.state = self.state, self.IDLE
-                if state == self.PENDING:
-                    self.timer.cancel()
-                    send_keys(_key(self.vk, TARGET_SCAN), _key(self.vk, TARGET_SCAN, up=True))
-                    emit(event="tap")
-                    return True
-                if state == self.HOLDING:
-                    emit(event="release")
-                    return True
-                return False  # PASSTHROUGH (or stray up): let it through
-            # Another key while the numpad key is held back: it was a typed '.', keep the order.
+                    return self._target_down(kb.vkCode)
+                return self._target_up((_key(self.vk, scan, extended=t_ext), _key(self.vk, scan, up=True, extended=t_ext)))
+            # Another key while the talk key is held back: it was typed (a '.' before a '5'), keep the order.
             if down and self.state == self.PENDING:
                 self.timer.cancel()
                 self.state = self.PASSTHROUGH
-                ext = bool(kb.flags & LLKHF_EXTENDED)
-                send_keys(_key(self.vk, TARGET_SCAN), _key(self.vk, TARGET_SCAN, up=True),
+                send_keys(_key(self.vk, scan, extended=t_ext), _key(self.vk, scan, up=True, extended=t_ext),
                           _key(kb.vkCode, kb.scanCode, extended=ext))
                 emit(event="tap")
                 return True
         return False
 
+    def handle_mouse(self, msg, ms):
+        """Mouse events: only side buttons matter. Called for every mouse move, so it returns early."""
+        if msg != WM_XBUTTONDOWN and msg != WM_XBUTTONUP:
+            return False
+        if ms.flags & LLMHF_INJECTED:
+            return False
+        button = (ms.mouseData >> 16) & 0xFFFF
+        down = msg == WM_XBUTTONDOWN
+        with self.lock:
+            if self.capturing and down and button in SIDE_BUTTONS:
+                return self._captured({"device": "mouse", "button": button}, ("mouse", button))
+            if self.swallow_up == ("mouse", button):
+                if not down:
+                    self.swallow_up = None
+                return True
+            if self.talk["device"] != "mouse" or button != self.talk["button"]:
+                return False
+            if down:
+                return self._target_down()
+            return self._target_up((_side_button(button), _side_button(button, up=True)))
+
+
+ptt = PushToTalk()
+
+
+def _message_loop():
+    msg = wt.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+
 
 def run_hook():
-    ptt = PushToTalk()
-
     @HOOKPROC
     def proc(n_code, w_param, l_param):
         if n_code == 0:
@@ -190,10 +329,55 @@ def run_hook():
     if not hook:
         emit(event="log", message=f"keyboard hook failed: error {ctypes.get_last_error()}")
         return
-    msg = wt.MSG()
-    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-        user32.TranslateMessage(ctypes.byref(msg))
-        user32.DispatchMessageW(ctypes.byref(msg))
+    _message_loop()
+
+
+class MouseHook:
+    """The mouse hook runs only while a side button is the talk key or a capture is waiting: it is
+    called for every mouse move, and costs nothing when it isn't installed."""
+
+    def __init__(self):
+        self.thread_id = None
+        self.proc = None
+
+    def sync(self, wanted):
+        if wanted and self.thread_id is None:
+            self._start()
+        elif not wanted and self.thread_id is not None:
+            tid, self.thread_id = self.thread_id, None
+            user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+
+    def _start(self):
+        ready = threading.Event()
+
+        @HOOKPROC
+        def proc(n_code, w_param, l_param):
+            if n_code == 0 and (w_param == WM_XBUTTONDOWN or w_param == WM_XBUTTONUP):
+                ms = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                try:
+                    if ptt.handle_mouse(w_param, ms):
+                        return 1
+                except Exception as exc:  # never let an error kill mouse input
+                    emit(event="log", message=f"mouse hook error: {type(exc).__name__}")
+            return user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+        def run():
+            hook = user32.SetWindowsHookExW(WH_MOUSE_LL, proc, kernel32.GetModuleHandleW(None), 0)
+            if not hook:
+                emit(event="log", message=f"mouse hook failed: error {ctypes.get_last_error()}")
+                ready.set()
+                return
+            self.thread_id = kernel32.GetCurrentThreadId()
+            ready.set()
+            _message_loop()
+            user32.UnhookWindowsHookEx(hook)
+
+        self.proc = proc  # keep the callback alive
+        threading.Thread(target=run, daemon=True).start()
+        ready.wait(2)
+
+
+mouse_hook = MouseHook()
 
 
 # --- Foreground tracking, for handing the keyboard back after typing ---------------------------
@@ -312,6 +496,18 @@ def run_commands():
             _jobs.put(cmd)  # transcribed in order on its own thread, so focus commands never wait
         elif cmd.get("cmd") == "restore_focus":
             restore_focus()
+        elif cmd.get("cmd") == "configure":
+            ptt.configure(cmd.get("talk"), cmd.get("hold_ms"))
+            if HOOKS:
+                mouse_hook.sync(ptt.wants_mouse())
+        elif cmd.get("cmd") == "capture":
+            if cmd.get("cancel"):
+                ptt.cancel_capture()
+            elif not HOOKS:
+                emit(event="captured", cancelled=True)
+            else:
+                ptt.capture()
+                mouse_hook.sync(True)
     os._exit(0)  # widget closed our stdin
 
 
@@ -338,16 +534,26 @@ def warm_up():
     emit(event="log", message=f"speech model ready in {time.perf_counter() - t0:.1f}s")
 
 
+HOOKS = "--no-hook" not in sys.argv
+
+
 def main():
     threading.Thread(target=_writer, daemon=True).start()
-    if "--no-hook" not in sys.argv:
+    try:
+        start = json.loads(os.environ.get("STUDENT_TWIN_VOICE") or "{}")
+    except ValueError:
+        start = {}
+    ptt.configure(start.get("talk"), start.get("hold_ms"))
+    if HOOKS:
         threading.Thread(target=run_hook, daemon=True).start()
+        mouse_hook.sync(ptt.wants_mouse())
     threading.Thread(target=run_focus_tracker, daemon=True).start()
     threading.Thread(target=run_fullscreen_watch, daemon=True).start()
+    # Commands are read from the start, so a settings change or a capture needn't wait for the model.
+    threading.Thread(target=run_commands, daemon=True).start()
     emit(event="ready")
     warm_up()
-    threading.Thread(target=run_transcriber, daemon=True).start()
-    run_commands()
+    run_transcriber()
 
 
 if __name__ == "__main__":

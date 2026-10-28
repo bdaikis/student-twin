@@ -70,12 +70,15 @@ button { font: inherit; color: inherit; }
 .shell:not(.card-view) .pill { display: inline-flex; }
 [data-view="rest"]:not(.hover) .pill, [data-view="success"] .pill { width: 28px; padding: 0; }
 /* On hover the pill widens evenly around the mark, so the dot stays where the resting dot was:
-   the grip on the left and the hide chevron on the right take 16 px each. */
+   the grip and the hide chevron take 16 px each, and an empty 16 px after the chevron balances the
+   settings gear beside the grip. */
 [data-view="rest"].hover .pill { padding: 0 6px; }
 [data-view="rest"].hover .grip { order: 1; }
-[data-view="rest"].hover .glyph { order: 2; }
-[data-view="rest"].hover .line { order: 3; }
-[data-view="rest"].hover .chev { order: 4; }
+[data-view="rest"].hover .gear { order: 2; }
+[data-view="rest"].hover .glyph { order: 3; }
+[data-view="rest"].hover .line { order: 4; }
+[data-view="rest"].hover .chev { order: 5; }
+[data-view="rest"].hover .pill::after { content: ""; order: 6; width: 16px; flex: none; }
 [data-view="rest"] .pill { background: rgb(var(--surface) / var(--a-rest)); cursor: pointer; }
 [data-view="rest"][data-online="0"] .pill,
 [data-view="rest"][data-voice="off"] .pill,
@@ -113,13 +116,17 @@ button { font: inherit; color: inherit; }
 [data-view="working"] .line:not(:empty) { display: block; }
 [data-view="rest"].hover .line:not(:empty) { display: block; color: var(--text-muted); font-size: 12px; }
 
-.grip, .chev { display: none; }
+.grip, .chev, .gear { display: none; }
 [data-view="rest"].hover .grip { display: block; width: 6px; height: 12px; margin: 0 5px; cursor: grab;
   background-image: radial-gradient(circle, rgba(255, 255, 255, 0.6) 1px, transparent 1.2px);
   background-size: 3px 4px; }
 [data-view="rest"].hover .chev { display: block; width: 16px; height: 20px; padding: 0; border: none; border-radius: 4px;
   background: transparent; color: var(--text-muted); cursor: pointer; font-size: 16px; line-height: 18px; }
 .chev:hover { color: var(--text); background: var(--chip); }
+[data-view="rest"].hover .gear { display: flex; align-items: center; justify-content: center; width: 16px; height: 20px;
+  padding: 0; border: none; border-radius: 4px; background: transparent; color: var(--text-muted); cursor: pointer; }
+.gear svg { width: 12px; height: 12px; fill: currentColor; }
+.gear:hover { color: var(--text); background: var(--chip); }
 
 /* ---- Card: answer, error, confirm, typing --------------------------------------------------- */
 .card {
@@ -167,7 +174,34 @@ button { font: inherit; color: inherit; }
 .close { position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; padding: 0; border: none; border-radius: 4px;
   background: transparent; color: var(--text-muted); cursor: pointer; font-size: 15px; line-height: 18px; }
 .close:hover { background: var(--chip); color: var(--text); }
-[data-view="answer"].hover .close, [data-view="error"].hover .close { display: block; }
+[data-view="answer"].hover .close, [data-view="error"].hover .close, [data-view="settings"] .close { display: block; }
+
+/* Settings card: opened by the gear, closed by its x; never takes focus, so no <select>. */
+[data-view="settings"] .settings { display: block; user-select: none; }
+.settings .title { font-weight: 600; margin-bottom: 6px; }
+.settings .row { display: flex; align-items: center; gap: 8px; min-height: 28px; }
+.settings .label { flex: 1; color: var(--text-muted); font-size: 12px; }
+.settings button { cursor: pointer; }
+.settings .value { max-width: 180px; padding: 3px 10px; border: 1px solid var(--hairline); border-radius: 4px;
+  background: var(--chip); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.settings .value:hover { border-color: rgba(255, 255, 255, 0.3); }
+.settings .value.capturing { border-color: var(--listen); color: var(--listen); }
+.settings .hint { color: var(--text-muted); font-size: 11px; line-height: 14px; text-align: right; }
+.settings .hint:empty { display: none; }
+.settings input[type="range"] { width: 120px; margin: 0; accent-color: var(--listen); cursor: pointer; }
+.settings .num { width: 40px; text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; }
+.settings .options { display: flex; flex-direction: column; gap: 1px; margin-bottom: 4px; }
+.settings .options button { position: relative; padding: 3px 8px 3px 24px; border: none; border-radius: 4px; background: transparent;
+  text-align: left; font-size: 12px; line-height: 18px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.settings .options button:hover { background: var(--chip); }
+.settings .options button[aria-checked="true"]::before { content: "\2713"; position: absolute; left: 8px; color: var(--listen); }
+.settings .options button:disabled { color: var(--text-muted); cursor: default; }
+.switch { position: relative; flex: none; width: 32px; height: 18px; padding: 0; border: 1px solid var(--hairline);
+  border-radius: 9px; background: var(--chip); }
+.switch i { position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--text-muted); transition: left var(--t-fade) var(--ease); }
+.switch[aria-checked="true"] { border-color: var(--listen); background: var(--listen); }
+.switch[aria-checked="true"] i { left: 16px; background: #fff; }
 
 .confirm .question { font-weight: 600; }
 .confirm .details { margin: 6px 0 0; padding-left: 16px; color: var(--text-muted); font-size: 12px; line-height: 16px; }
@@ -210,4 +244,6 @@ button { font: inherit; color: inherit; }
   .dot, .bars i, .dots i { background: CanvasText; forced-color-adjust: none; }
   .tick, .bang, .body::before { color: CanvasText; background: Canvas; forced-color-adjust: none; }
   #input { box-shadow: none; border: 1px solid Highlight; }
+  .switch, .settings .value { border-color: CanvasText; }
+  .switch[aria-checked="true"] { background: Highlight; }
 }

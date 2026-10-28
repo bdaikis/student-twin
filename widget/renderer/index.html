@@ -8,16 +8,16 @@
 </head>
 <body>
   <!-- One shape at a time: the pill (rest, listening, working, tick) or a card (answer, error,
-       confirm, typing). The window is sized to it and centred on the top of the screen. On hover the
-       pill widens evenly around its mark (grip left, hide chevron right), so the dot stays under
-       the cursor. No title=
-       attributes anywhere: native tooltips are separate OS windows that can escape content
-       protection. -->
+       confirm, typing, settings). The window is sized to it and centred on the top of the screen.
+       On hover the pill widens evenly around its mark (grip and settings gear left, hide chevron
+       right), so the dot stays under the cursor. No title= attributes or <select> anywhere: native
+       tooltips and dropdowns are separate OS windows that can escape content protection. -->
   <div id="shell" class="shell" data-view="rest" data-voice="starting" data-online="1">
     <div id="inner" class="inner">
       <div class="pill" id="pill" role="status" aria-label="Idle">
         <button class="chev" id="hide" aria-label="Hide">&#x203A;</button>
         <span class="grip" id="grip" aria-hidden="true"></span>
+        <button class="gear" id="gear" aria-label="Settings"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd" d="M13.16 6.40 L15.06 6.57 L15.06 9.43 L13.16 9.60 L12.78 10.52 L14.00 11.98 L11.98 14.00 L10.52 12.78 L9.60 13.16 L9.43 15.06 L6.57 15.06 L6.40 13.16 L5.48 12.78 L4.02 14.00 L2.00 11.98 L3.22 10.52 L2.84 9.60 L0.94 9.43 L0.94 6.57 L2.84 6.40 L3.22 5.48 L2.00 4.02 L4.02 2.00 L5.48 3.22 L6.40 2.84 L6.57 0.94 L9.43 0.94 L9.60 2.84 L10.52 3.22 L11.98 2.00 L14.00 4.02 L12.78 5.48 Z M10.2 8 A2.2 2.2 0 1 0 5.8 8 A2.2 2.2 0 1 0 10.2 8 Z"/></svg></button>
         <span class="glyph" aria-hidden="true">
           <span class="dot"></span>
           <span class="bang">!</span>
@@ -33,6 +33,25 @@
         <div class="body" id="body" aria-live="polite"></div>
         <div class="confirm" id="confirm" role="alertdialog"></div>
         <textarea id="input" rows="1" placeholder="Type a request" aria-label="Type a request"></textarea>
+        <div class="settings" id="settings">
+          <div class="title">Settings</div>
+          <div class="row">
+            <span class="label">Hold to talk</span>
+            <button class="value" id="talk-key"></button>
+          </div>
+          <div class="hint" id="talk-hint"></div>
+          <div class="row">
+            <span class="label">Hold time</span>
+            <input type="range" id="hold" min="150" max="1000" step="50" aria-label="Hold time">
+            <span class="num" id="hold-val"></span>
+          </div>
+          <div class="row"><span class="label">Microphone</span></div>
+          <div class="options" id="mics" role="radiogroup" aria-label="Microphone"></div>
+          <div class="row">
+            <span class="label">Start with Windows</span>
+            <button class="switch" id="autostart" role="switch" aria-checked="false" aria-label="Start with Windows"><i></i></button>
+          </div>
+        </div>
       </div>
     </div>
   </div>

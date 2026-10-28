@@ -101,7 +101,8 @@ hermes gateway restart
 ```
 
 `setup_machine.py` writes everything that holds this machine's paths, so the same repo works in any
-user folder. Add `--widget-autostart` to start the widget at sign-in.
+user folder. Add `--widget-autostart` to start the widget at sign-in (the same as *Start with
+Windows* in the widget's settings).
 
 On a second machine while the first still runs the twin, add `--jobs-paused --telegram off` before
 starting Hermes there: the jobs are created switched off, and Hermes doesn't poll the bot (two
@@ -110,6 +111,9 @@ machines polling one bot split its messages between them, and both would send ev
 ### 7. Start and check
 
 - Start the widget: `cd widget; npm start`. Hold the numpad `.` key and speak, or click it to type.
+  No numpad? Hover over the widget, click the gear beside the grip, and pick another key or a
+  mouse side button under *Hold to talk*. Settings are kept per machine in
+  `%LOCALAPPDATA%\student-twin\widget.json`.
 - Send your bot a message on Telegram, then `/new` after any change to tools or settings.
 - Ask "what's due this week?" in both places.
 

@@ -353,7 +353,83 @@ async function ask(sender, id, text) {
   }
 }
 
-// --- Voice helper (step 2c): numpad push-to-talk hook + Hermes's local faster-whisper ----------
+// --- Settings (the gear on the hovered pill, 2026-10-28) ------------------------------------------
+// Per machine, in <data>/widget.json, which transfer_state.py doesn't carry: the laptop holds numpad
+// '.' to talk, the desktop (a 65% keyboard, no numpad) a mouse side button.
+const DEFAULT_TALK = { device: 'key', scan: 0x53, extended: false, name: 'Numpad .' };
+const SIDE_BUTTONS = { 1: 'Mouse back button', 2: 'Mouse forward button' };
+const HOLD_MS = { min: 150, max: 1000, default: 300 };
+let settings = null; // loaded when the app is ready
+
+function settingsFile() { return path.join(TWIN_DATA, 'widget.json'); }
+
+function cleanTalk(t) {
+  if (t && t.device === 'mouse' && SIDE_BUTTONS[t.button]) return { device: 'mouse', button: t.button, name: SIDE_BUTTONS[t.button] };
+  if (t && t.device === 'key' && Number.isInteger(t.scan) && t.scan > 0 && t.scan < 0x100) {
+    return { device: 'key', scan: t.scan, extended: Boolean(t.extended), name: String(t.name || `Key ${t.scan}`).slice(0, 40) };
+  }
+  return null;
+}
+function cleanHold(ms) { const n = Number(ms); return n >= HOLD_MS.min && n <= HOLD_MS.max ? Math.round(n) : null; }
+function cleanMic(m) { return m && typeof m.id === 'string' && m.id ? { id: m.id.slice(0, 200), label: String(m.label || '').slice(0, 200) } : null; }
+
+function loadSettings() {
+  let s = {};
+  try { s = JSON.parse(fs.readFileSync(settingsFile(), 'utf8')); } catch {}
+  return { talk: cleanTalk(s.talk) || DEFAULT_TALK, hold_ms: cleanHold(s.hold_ms) || HOLD_MS.default, microphone: cleanMic(s.microphone) };
+}
+
+function saveSettings() {
+  const file = settingsFile();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify(settings, null, 1));
+    fs.renameSync(`${file}.tmp`, file);
+  } catch {}
+}
+
+// Start with Windows: the same Startup-folder script `setup_machine.py --widget-autostart` writes,
+// so the two never make a second entry. Its text must match setup_machine.py's exactly.
+const STARTUP_VBS = path.join(process.env.APPDATA, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'Student_Twin_Widget.vbs');
+function setStartWithWindows(on) {
+  try {
+    if (!on) { fs.rmSync(STARTUP_VBS, { force: true }); return; }
+    const electron = path.join(__dirname, 'node_modules', 'electron', 'dist', 'electron.exe');
+    fs.writeFileSync(STARTUP_VBS,
+      "' Starts the Student Twin widget at sign-in. Written by scripts/setup_machine.py or the widget's settings.\r\n" +
+      'Set sh = CreateObject("WScript.Shell")\r\n' +
+      `sh.CurrentDirectory = "${__dirname}"\r\n` +
+      `sh.Run """${electron}"" .", 0, False\r\n`);
+  } catch {}
+}
+
+function settingsForPage() { return { ...settings, start_with_windows: fs.existsSync(STARTUP_VBS) }; }
+
+function updateSettings(patch) {
+  if ('talk' in patch) settings.talk = cleanTalk(patch.talk) || settings.talk;
+  if ('hold_ms' in patch) settings.hold_ms = cleanHold(patch.hold_ms) || settings.hold_ms;
+  if ('microphone' in patch) settings.microphone = cleanMic(patch.microphone);
+  if ('start_with_windows' in patch) setStartWithWindows(Boolean(patch.start_with_windows));
+  saveSettings();
+  configureHelper();
+  return settingsForPage();
+}
+
+function voiceReady() { return { ok: true, message: `Voice ready: hold ${settings.talk.name} to talk` }; }
+
+// Sent after every change, and after a capture ends either way: the helper drops its mouse hook
+// when no side button needs it.
+function configureHelper() {
+  if (helper) helper.stdin.write(`${JSON.stringify({ cmd: 'configure', talk: settings.talk, hold_ms: settings.hold_ms })}\n`);
+  if (lastVoiceStatus?.ok) toRenderer('voice:status', voiceReady());
+}
+
+function captureTalk(on) {
+  if (!helper) return toRenderer('settings:captured', { cancelled: true });
+  helper.stdin.write(`${JSON.stringify(on ? { cmd: 'capture' } : { cmd: 'capture', cancel: true })}\n`);
+}
+
+// --- Voice helper (step 2c): push-to-talk hook + Hermes's local faster-whisper -----------------
 const HERMES_HOME = path.dirname(HERMES_ENV);
 let helper = null;
 const pendingAudio = new Map(); // transcription id -> temp wav path
@@ -383,7 +459,8 @@ function startHelper() {
   }
   helper = spawn(python, [path.join(__dirname, 'helper', 'voice_helper.py')], {
     env: { ...process.env, HERMES_HOME, PYTHONPATH: path.join(HERMES_HOME, 'hermes-agent'), PYTHONIOENCODING: 'utf-8',
-      STUDENT_TWIN_WIDGET_PID: String(process.pid) },
+      STUDENT_TWIN_WIDGET_PID: String(process.pid),
+      STUDENT_TWIN_VOICE: JSON.stringify({ talk: settings.talk, hold_ms: settings.hold_ms }) },
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'ignore'],
   });
@@ -406,9 +483,17 @@ function startHelper() {
         toRenderer('voice:transcript', ev);
         break;
       }
+      case 'captured': {
+        const talk = !ev.cancelled && cleanTalk(ev.talk);
+        if (talk) { settings.talk = talk; saveSettings(); }
+        configureHelper();
+        toRenderer('settings:captured', talk ? { talk } : { cancelled: true });
+        break;
+      }
       case 'log':
-        if (ev.message.startsWith('speech model ready')) toRenderer('voice:status', { ok: true, message: 'Voice ready: hold numpad . to talk' });
+        if (ev.message.startsWith('speech model ready')) toRenderer('voice:status', voiceReady());
         else if (ev.message.startsWith('keyboard hook failed')) toRenderer('voice:status', { ok: false, message: 'Voice is off: the push-to-talk key could not be registered.' });
+        else if (ev.message.startsWith('mouse hook failed')) toRenderer('voice:status', { ok: false, message: 'Voice is off: the mouse button could not be registered.' });
         break;
       default: break;
     }
@@ -547,6 +632,7 @@ app.whenReady().then(() => {
   session.defaultSession.setPermissionRequestHandler((_wc, permission, cb, details) =>
     cb(permission === 'media' && (details.mediaTypes || []).every((t) => t === 'audio')));
   session.defaultSession.setPermissionCheckHandler((_wc, permission) => permission === 'media');
+  settings = loadSettings();
   createWindow();
   win.webContents.once('did-finish-load', startHelper);
   // On every load (including a reload) tell the page what it may have missed.
@@ -567,6 +653,9 @@ app.whenReady().then(() => {
   ipcMain.on('twin:cancel', (_e, { id }) => inflight.get(id)?.abort());
   ipcMain.on('mic:audio', (_e, { id, wav }) => transcribeWav(id, wav));
   ipcMain.on('confirm:answer', (_e, { id, decision }) => answerConfirm(String(id), decision));
+  ipcMain.handle('settings:get', () => settingsForPage());
+  ipcMain.handle('settings:set', (_e, patch) => updateSettings(patch && typeof patch === 'object' ? patch : {}));
+  ipcMain.on('settings:capture', (_e, on) => captureTalk(Boolean(on)));
   touchAlive();
   setInterval(touchAlive, 5000);
   setInterval(pollConfirm, 250);

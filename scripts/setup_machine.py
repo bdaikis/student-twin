@@ -186,16 +186,18 @@ def jobs(apply: bool, paused: bool) -> list[str]:
 
 
 def widget_autostart(apply: bool) -> list[str]:
+    # The widget's "Start with Windows" switch writes the same file (widget/main.js, setStartWithWindows);
+    # keep the two texts identical. Bytes, so Windows' text mode doesn't double the \r.
     electron = REPO / "widget" / "node_modules" / "electron" / "dist" / "electron.exe"
-    text = ("' Starts the Student Twin widget at sign-in. Written by scripts/setup_machine.py.\r\n"
+    text = ("' Starts the Student Twin widget at sign-in. Written by scripts/setup_machine.py or the widget's settings.\r\n"
             'Set sh = CreateObject("WScript.Shell")\r\n'
             f'sh.CurrentDirectory = "{REPO / "widget"}"\r\n'
-            f'sh.Run """{electron}"" .", 0, False\r\n')
+            f'sh.Run """{electron}"" .", 0, False\r\n').encode("utf-8")
     path = STARTUP / "Student_Twin_Widget.vbs"
-    if path.exists() and path.read_text(encoding="utf-8") == text:
+    if path.exists() and path.read_bytes() == text:
         return []
     if apply:
-        path.write_text(text, encoding="utf-8")
+        path.write_bytes(text)
     return [f"widget autostart {path}"]
 
 

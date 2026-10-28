@@ -23,4 +23,8 @@ contextBridge.exposeInMainWorld('twin', {
   onConfirm: (cb) => ipcRenderer.on('confirm:show', (_e, m) => cb(m)),
   onConfirmGone: (cb) => ipcRenderer.on('confirm:gone', (_e, m) => cb(m)),
   answerConfirm: (id, decision) => ipcRenderer.send('confirm:answer', { id, decision }),
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  setSettings: (patch) => ipcRenderer.invoke('settings:set', patch),
+  captureTalk: (on) => ipcRenderer.send('settings:capture', Boolean(on)),
+  onCaptured: (cb) => ipcRenderer.on('settings:captured', (_e, m) => cb(m)),
 });

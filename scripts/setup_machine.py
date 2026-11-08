@@ -6,7 +6,8 @@ Run it with the twin's own Python, from the repo:
     <venv>\\Scripts\\python.exe scripts\\setup_machine.py --apply    change it
 Options: --jobs-paused creates missing scheduled jobs switched off and --telegram off keeps Hermes
 from polling the bot (both for a second machine before its cutover; --telegram on at the cutover);
---widget-autostart starts the widget at sign-in.
+--widget-autostart starts the widget at sign-in; --hermes-url points the widget at another machine's
+Hermes over Tailscale (or back to local).
 
 What it writes, each only when different from what is there:
 - Hermes's config.yaml: the `desktop` and `portal` MCP servers (this Python, this repo, this data
@@ -185,6 +186,35 @@ def jobs(apply: bool, paused: bool) -> list[str]:
     return changed
 
 
+def widget_hermes(apply: bool, url: str) -> list[str]:
+    """Which Hermes the widget talks to, in <data>/widget.json: "local" (this machine's, the default)
+    or another machine's address over Tailscale, e.g. http://harjets-pc:8642 (desktop host plan 3.2).
+    The widget reads it at start, so restart the widget afterwards."""
+    from urllib.parse import urlparse
+    path = DATA / "widget.json"
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        settings = {}
+    if url == "local":
+        want = None
+    else:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            sys.exit(f"--hermes-url wants local or an address like http://harjets-pc:8642, not {url!r}")
+        want = f"{parsed.scheme}://{parsed.netloc}"
+    if settings.get("hermes_url") == want:
+        return []
+    if apply:
+        if want:
+            settings["hermes_url"] = want
+        else:
+            settings.pop("hermes_url", None)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(settings, indent=1), encoding="utf-8")
+    return [f"widget Hermes address {want or 'local'} in {path}"]
+
+
 def widget_autostart(apply: bool) -> list[str]:
     # The widget's "Start with Windows" switch writes the same file (widget/main.js, setStartWithWindows);
     # keep the two texts identical. Bytes, so Windows' text mode doesn't double the \r.
@@ -208,6 +238,8 @@ def main() -> None:
     ap.add_argument("--telegram", choices=["on", "off"],
                     help="off: Hermes doesn't poll the bot (a second machine before its cutover); on: it does")
     ap.add_argument("--widget-autostart", action="store_true", help="start the widget at sign-in")
+    ap.add_argument("--hermes-url", metavar="URL",
+                    help="the Hermes the widget talks to: local, or another machine's, e.g. http://harjets-pc:8642")
     args = ap.parse_args()
     try:
         import mcp  # noqa: F401
@@ -218,6 +250,8 @@ def main() -> None:
     changes = hermes_config(args.apply, args.telegram) + launchers(args.apply) + jobs(args.apply, args.jobs_paused)
     if args.widget_autostart:
         changes += widget_autostart(args.apply)
+    if args.hermes_url:
+        changes += widget_hermes(args.apply, args.hermes_url)
     if not changes:
         print("Nothing to change: this machine's setup matches the repo.")
         return

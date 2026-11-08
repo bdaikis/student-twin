@@ -162,6 +162,24 @@ so that no reminder is sent twice. Only one machine may run the Telegram bot at 
 on the old machine first, then run `setup_machine.py --apply --telegram on` on the new one, resume
 its jobs and restart Hermes there.
 
+### The widget on a second computer
+
+One computer runs Hermes; the widget can run on another and talk to it over
+[Tailscale](https://tailscale.com), a private network between your own devices, so nothing is
+opened to the internet.
+
+1. Install Tailscale on both and sign in with the same personal account.
+2. On the computer running Hermes, which keeps listening on `127.0.0.1` only, forward its port
+   to your tailnet: `tailscale serve --bg --tcp 8642 tcp://127.0.0.1:8642`.
+3. On the other computer, put that computer's `API_SERVER_KEY` in its Hermes `.env` (the widget
+   reads its key from there), point the widget at it with
+   `setup_machine.py --apply --hermes-url http://<computer name>:8642`, and restart the widget.
+   `--hermes-url local` points it back.
+
+Until that Hermes can use the second computer's own tools, its app, window, file, clipboard and
+screen tools act on the computer running Hermes, and the widget tells the twin so; snips stay
+off there. A remote widget keeps its own conversation rather than continuing Telegram's.
+
 ## Privacy
 
 - Your settings, tokens and data stay on your machine. Secrets are kept in the operating system's

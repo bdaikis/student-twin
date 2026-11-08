@@ -18,15 +18,21 @@ if (!app.requestSingleInstanceLock()) {
 }
 app.on('second-instance', () => showWidget());
 
-// Hermes's OpenAI-compatible api_server, loopback only. Its key never leaves this process.
-const HERMES_URL = 'http://127.0.0.1:8642/v1/chat/completions';
-const HERMES_HEALTH = 'http://127.0.0.1:8642/health';
+// Hermes's OpenAI-compatible api_server. On the machine that runs Hermes it is the loopback
+// address; another machine's widget reaches it over Tailscale (widget.json "hermes_url", set by
+// setup_machine.py --hermes-url; desktop host plan 3.2). The key comes from this machine's Hermes
+// .env and never leaves this process.
+const LOCAL_HERMES = 'http://127.0.0.1:8642';
+function hermesBase() { return (settings && settings.hermes_url) || LOCAL_HERMES; }
+function hermesRemote() { return !['127.0.0.1', 'localhost', '[::1]'].includes(new URL(hermesBase()).hostname); }
 const HERMES_ENV = path.join(process.env.HERMES_HOME || path.join(process.env.LOCALAPPDATA, 'hermes'), '.env');
 let sessionId = null; // X-Hermes-Session-Id when no Telegram conversation exists yet
 // The widget and Telegram share one conversation: each request continues Telegram's current
 // session, read from Hermes's routing mirror, so a /new on Telegram starts a new one for both.
+// A widget on another machine can't read that mirror, so it keeps its own session (plan step 3.5).
 const HERMES_SESSIONS = path.join(process.env.HERMES_HOME || path.join(process.env.LOCALAPPDATA, 'hermes'), 'sessions', 'sessions.json');
 function sharedSessionId() {
+  if (hermesRemote()) return null;
   try {
     const all = Object.values(JSON.parse(fs.readFileSync(HERMES_SESSIONS, 'utf8')))
       .filter((s) => s && s.platform === 'telegram' && s.chat_type === 'dm' && s.session_id);
@@ -263,7 +269,7 @@ function pollReveal() {
 let online = null;
 async function pollOnline() {
   let ok = false;
-  try { ok = (await fetch(HERMES_HEALTH, { signal: AbortSignal.timeout(3000) })).ok; } catch {}
+  try { ok = (await fetch(`${hermesBase()}/health`, { signal: AbortSignal.timeout(3000) })).ok; } catch {}
   if (ok !== online) { online = ok; toRenderer('twin:online', ok); }
 }
 
@@ -274,6 +280,9 @@ function hermesKey() {
 
 function explain(err) {
   const code = err && (err.cause?.code || err.code);
+  if (hermesRemote() && ['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'EHOSTUNREACH', 'ECONNRESET', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) {
+    return `The twin at ${new URL(hermesBase()).hostname} can't be reached. Is that computer on, and Tailscale connected here?`;
+  }
   if (code === 'ECONNREFUSED') return "The twin isn't running. Start it with: hermes gateway start";
   if (err && err.status === 401) return "The widget's key doesn't match Hermes's API key.";
   if (err && err.code === 'ENOENT') return "Hermes's settings file wasn't found.";
@@ -291,6 +300,15 @@ const WIDGET_RULES = [
   `When a request is a command (open, close, play, pause, arrange, focus, minimize, delete and the like) and every action it needed succeeded exactly as asked, reply with only the single character ${DONE_MARK} and nothing else; the widget shows a tick instead of text. This includes an irreversible action he confirmed on the card: a successful delete also gets only ${DONE_MARK}.`,
   'Reply in words instead when an action failed or only partly worked, when you had to guess what he meant (say what you assumed), when you need to ask him something, or when he asked for information such as the weather, what is posted in a course, or what a page says.',
   `When he cancels a confirm card or it times out, reply with only ${DONE_MARK}: the card already shows the outcome. No screenshots here: he can see the screen.`,
+].join(' ');
+// Added while this widget talks to Hermes on another computer: until that Hermes can reach this
+// machine's own tools (plan step 3.3), every desktop tool would act on the other computer.
+const REMOTE_RULE = [
+  "This widget is on Bhanu's laptop, but you run on his desktop PC at home, so the desktop tools (apps,",
+  'windows, music, files, the clipboard screenshot and screen control) act on the desktop, not on the laptop',
+  'in front of him. For a request that would use them, say it would run on the desktop at home and is not',
+  'available from the laptop yet; do it on the desktop only if he says so. Questions about deadlines, courses,',
+  'attendance, the weather or the web work as usual.',
 ].join(' ');
 
 // Added to the rules when a snip sends itself (hold Ctrl and move, or Win+Shift+S; 2026-11-03).
@@ -315,7 +333,7 @@ function clockLine() {
 
 // Stream one answer from Hermes, forwarding text deltas to the renderer as they arrive.
 async function ask(sender, id, text, kind) {
-  const rules = kind === 'snip' ? `${WIDGET_RULES} ${SNIP_RULES}` : WIDGET_RULES;
+  const rules = [WIDGET_RULES, kind === 'snip' && SNIP_RULES, hermesRemote() && REMOTE_RULE].filter(Boolean).join(' ');
   const controller = new AbortController();
   inflight.set(id, controller);
   try {
@@ -325,7 +343,7 @@ async function ask(sender, id, text, kind) {
     const session = sharedSessionId() || sessionId;
     if (session) headers['X-Hermes-Session-Id'] = session;
     markBusy(true);
-    const res = await fetch(HERMES_URL, {
+    const res = await fetch(`${hermesBase()}/v1/chat/completions`, {
       method: 'POST',
       headers,
       body: JSON.stringify({
@@ -385,12 +403,22 @@ function cleanTalk(t) {
 }
 function cleanHold(ms) { const n = Number(ms); return n >= HOLD_MS.min && n <= HOLD_MS.max ? Math.round(n) : null; }
 function cleanMic(m) { return m && typeof m.id === 'string' && m.id ? { id: m.id.slice(0, 200), label: String(m.label || '').slice(0, 200) } : null; }
+// "http://host:port" of a Hermes on another machine; anything else means the local one.
+function cleanHermesUrl(u) {
+  try {
+    const url = new URL(String(u));
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.origin : null;
+  } catch { return null; }
+}
 
 function loadSettings() {
   let s = {};
   try { s = JSON.parse(fs.readFileSync(settingsFile(), 'utf8')); } catch {}
-  return { talk: cleanTalk(s.talk) || DEFAULT_TALK, hold_ms: cleanHold(s.hold_ms) || HOLD_MS.default, microphone: cleanMic(s.microphone),
+  const loaded = { talk: cleanTalk(s.talk) || DEFAULT_TALK, hold_ms: cleanHold(s.hold_ms) || HOLD_MS.default, microphone: cleanMic(s.microphone),
     snip: s.snip !== false };
+  const hermes = cleanHermesUrl(s.hermes_url);
+  if (hermes) loaded.hermes_url = hermes;
+  return loaded;
 }
 
 function saveSettings() {
@@ -492,7 +520,7 @@ function startHelper() {
         if (ev.phase === 'arm') snipArm();
         else snipEnd(ev.phase === 'release');
         break;
-      case 'snip_ready': if (settings.snip) snipAsk(); break;
+      case 'snip_ready': if (settings.snip && !hermesRemote()) snipAsk(); break;
       case 'grabbed': snipGrabbed(ev); break;
       case 'transcript': {
         if (!pendingAudio.has(ev.id)) break; // given up on (TRANSCRIBE_TIMEOUT_MS); too late to act on
@@ -600,8 +628,10 @@ function createSnipWindow() {
   snipWin.loadFile(path.join(__dirname, 'renderer', 'snip.html'));
 }
 
+// Off while the widget talks to Hermes on another computer: latest_screenshot would read that
+// computer's clipboard, not this one's (until desktop host plan step 3.3).
 function snipArm() {
-  if (!settings.snip || snipGesture || !snipWin) return;
+  if (!settings.snip || hermesRemote() || snipGesture || !snipWin) return;
   const start = screen.getCursorScreenPoint();
   // One row short of the display: a window covering it exactly would count as a full-screen app.
   const { bounds } = screen.getDisplayNearestPoint(start);

@@ -178,13 +178,14 @@ function newId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function ask(text) {
+// kind 'snip': the main process sends its own request and the snip rules; text is what shows.
+function ask(text, kind) {
   const id = newId();
   answers.set(id, { request: text, text: '', interrupted: false });
   current = id;
   line.textContent = text;
   if (!confirms.size) setView('working');
-  window.twin.ask(id, text);
+  window.twin.ask(id, text, kind);
 }
 
 function showAnswer(a, streaming) {
@@ -501,6 +502,7 @@ const holdInput = document.getElementById('hold');
 const holdVal = document.getElementById('hold-val');
 const micList = document.getElementById('mics');
 const autostart = document.getElementById('autostart');
+const snipSwitch = document.getElementById('snip');
 let prefs = null; // the settings as the main process last returned them
 let micDevice = null; // the chosen microphone's current device id, or null for Windows' default
 
@@ -513,6 +515,7 @@ function showPrefs() {
   holdInput.value = prefs.hold_ms;
   holdVal.textContent = seconds(prefs.hold_ms);
   autostart.setAttribute('aria-checked', String(Boolean(prefs.start_with_windows)));
+  snipSwitch.setAttribute('aria-checked', String(prefs.snip !== false));
 }
 
 async function listMics() {
@@ -587,6 +590,11 @@ holdInput.addEventListener('change', async () => {
 
 autostart.addEventListener('click', async () => {
   prefs = await window.twin.setSettings({ start_with_windows: !prefs.start_with_windows });
+  showPrefs();
+});
+
+snipSwitch.addEventListener('click', async () => {
+  prefs = await window.twin.setSettings({ snip: prefs.snip === false });
   showPrefs();
 });
 
@@ -734,6 +742,15 @@ window.twin.onMic(async (action) => {
     showError(`Couldn't use the microphone (${err.name}).`);
   }
 });
+
+// ---- Snips (2026-11-03) ---------------------------------------------------------------------------
+// A finished snip (Ctrl held and moved, or Win+Shift+S) asks on its own, like a new spoken command:
+// whatever the twin was doing stops first.
+window.twin.onSnip(() => {
+  interrupt();
+  ask('Your snip', 'snip');
+});
+window.twin.onSnipError((message) => showError(message));
 
 window.twin.onTranscript(({ id, ok, text, error }) => {
   if (superseded.delete(id)) return;

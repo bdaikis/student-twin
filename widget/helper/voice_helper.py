@@ -7,9 +7,15 @@ Protocol: JSON lines. Commands on stdin, events on stdout.
             {"event": "fullscreen", "busy": true|false} (a full-screen app is in front, or not)
             {"event": "tap"} | {"event": "transcript", "id", "ok", "text", "error", "ms"}
             {"event": "captured", "talk": {...}} | {"event": "captured", "cancelled": true}
+            {"event": "snip", "phase": "arm"|"cancel"|"release"}   (the Ctrl gesture, below)
+            {"event": "snip_ready", "source": "snipping"}   (a Win+Shift+S image reached the clipboard)
+            {"event": "grabbed", "id", "ok": true, "width", "height"} | {"event": "grabbed", "id", "ok": false, "error"}
             {"event": "log", "message"}
   commands: {"cmd": "transcribe", "id": "...", "path": "C:/...wav"} | {"cmd": "restore_focus"}
-            {"cmd": "configure", "talk": {...}, "hold_ms": 300} | {"cmd": "capture", "cancel"?: true}
+            {"cmd": "configure", "talk": {...}, "hold_ms": 300, "snip": true}
+            {"cmd": "capture", "cancel"?: true}
+            {"cmd": "grab", "id": "...", "points": [[x, y], ...]} or "rect": [left, top, right, bottom]
+                (physical pixels; points: a freeform trace, closed back to its start)
             {"cmd": "quit"}
 
 restore_focus gives the keyboard back to the app that was in front before the widget took focus
@@ -25,6 +31,17 @@ The default is the numpad '.'/'Del' key (scan code 0x53, NOT extended; the main 
 with the extended flag). The press is held back; released before the hold time it is re-sent as a
 normal tap; held past it, it means "talk". A press made with any modifier down is never touched.
 "capture" reports the next key or side button pressed (Esc cancels) instead of acting on it.
+
+Snipping (2026-11-03, freeform since 11-04): holding Ctrl on its own and moving the pointer
+traces a shape on the screen, which goes to the twin when Ctrl is released. This process only
+tells Ctrl alone apart from Ctrl as part of a shortcut: "arm" when Ctrl goes down with no other
+modifier, "cancel" as soon as another key, a mouse button or the wheel is used (Ctrl+C,
+Ctrl+click, Ctrl+scroll), and "release" when Ctrl comes up still alone. The widget follows the
+pointer and draws the trace, and asks for the pixels with "grab", which keeps what is inside the
+shape and turns the rest white. Nothing is swallowed: Ctrl and everything pressed with it
+reach the app as usual. It never arms while a full-screen app is in front or the pointer is
+hidden (games hold Ctrl to crouch or sprint while turning). Win+Shift+S is watched too: the next
+clipboard change within 90 s that holds an image is reported as "snip_ready".
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -64,6 +81,10 @@ WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
 WM_QUIT = 0x0012
 WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0100, 0x0101, 0x0104, 0x0105
 WM_XBUTTONDOWN, WM_XBUTTONUP = 0x020B, 0x020C
+WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN = 0x0201, 0x0204, 0x0207
+WM_MOUSEWHEEL, WM_MOUSEHWHEEL = 0x020A, 0x020E
+SNIP_CANCELS = {WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN, WM_MOUSEWHEEL, WM_MOUSEHWHEEL}
+VK_LCONTROL, VK_RCONTROL, VK_S = 0xA2, 0xA3, 0x53
 LLKHF_EXTENDED, LLKHF_INJECTED = 0x01, 0x10
 LLMHF_INJECTED = 0x01
 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x0001, 0x0002
@@ -306,6 +327,224 @@ class PushToTalk:
 ptt = PushToTalk()
 
 
+# --- Snipping: Ctrl held alone + pointer movement, and Win+Shift+S -----------------------------
+class CURSORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("flags", wt.DWORD), ("hCursor", wt.HANDLE), ("ptScreenPos", wt.POINT)]
+
+
+CURSOR_SHOWING = 0x01
+CLIPBOARD_IMAGE_FORMATS = (8, 17, 2)  # CF_DIB, CF_DIBV5, CF_BITMAP
+SNIPPING_WATCH_S = 90
+user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
+user32.GetClipboardSequenceNumber.restype = wt.DWORD
+user32.IsClipboardFormatAvailable.argtypes = [wt.UINT]
+_fullscreen = False  # set by run_fullscreen_watch
+
+
+def _down(vk):
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def cursor_showing():
+    ci = CURSORINFO(cbSize=ctypes.sizeof(CURSORINFO))
+    return not user32.GetCursorInfo(ctypes.byref(ci)) or bool(ci.flags & CURSOR_SHOWING)
+
+
+class SnipGesture:
+    IDLE, ARMED, BLOCKED = range(3)
+
+    def __init__(self):
+        self.enabled = True
+        self.state = self.IDLE
+        self.lock = threading.Lock()
+        self.ctrl_up_seen = 0  # watchdog: consecutive looks that found Ctrl up while not IDLE
+        self.watch = threading.Event()
+        self.watch_seq = 0
+        self.watch_until = 0.0
+
+    def _set(self, state, phase=None):
+        """Under the lock."""
+        self.state = state
+        if phase:
+            emit(event="snip", phase=phase)
+        _hook_jobs.put(None)  # the mouse hook is wanted only while armed
+
+    def key(self, msg, kb):
+        """Keyboard events from the hook. Never swallows anything, and stays fast."""
+        down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        with self.lock:
+            if kb.vkCode in (VK_LCONTROL, VK_RCONTROL, VK_CONTROL):
+                if down:
+                    if self.state == self.IDLE:  # a new press; key repeat finds it ARMED or BLOCKED
+                        alone = not any(_down(vk) for vk in (VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN))
+                        if self.enabled and alone and not _fullscreen and cursor_showing():
+                            self._set(self.ARMED, "arm")
+                        else:
+                            self.state = self.BLOCKED
+                elif self.state == self.ARMED:
+                    self._set(self.IDLE, "release")
+                else:
+                    self.state = self.IDLE
+                return
+            if down and self.state == self.ARMED:
+                self._set(self.BLOCKED, "cancel")  # Ctrl+C, Ctrl+Z, Ctrl+Shift...: a shortcut
+            if down and kb.vkCode == VK_S and self.enabled and (_down(VK_LWIN) or _down(VK_RWIN)) and _down(VK_SHIFT):
+                self.watch_seq = user32.GetClipboardSequenceNumber()
+                self.watch_until = time.monotonic() + SNIPPING_WATCH_S
+                self.watch.set()
+
+    def mouse(self):
+        """A button or the wheel was used: Ctrl+click and Ctrl+scroll are not snips."""
+        with self.lock:
+            if self.state == self.ARMED:
+                self._set(self.BLOCKED, "cancel")
+
+    def watchdog(self):
+        """A Ctrl release the hook never saw (the secure desktop, a dropped hook) would leave the
+        gesture stuck. Two looks half a second apart, so a release still on its way to the hook
+        isn't mistaken for a lost one."""
+        while True:
+            time.sleep(0.5)
+            self.watchdog_look()
+
+    def watchdog_look(self):
+        with self.lock:
+            if self.state == self.IDLE or _down(VK_CONTROL):
+                self.ctrl_up_seen = 0
+                return
+            self.ctrl_up_seen += 1
+            if self.ctrl_up_seen >= 2:
+                self.ctrl_up_seen = 0
+                if self.state == self.ARMED:
+                    self._set(self.IDLE, "cancel")
+                else:
+                    self.state = self.IDLE
+
+    def clipboard_watch(self):
+        """After Win+Shift+S: the next clipboard change, if it is an image, is the snip."""
+        while True:
+            self.watch.wait()
+            time.sleep(0.2)
+            with self.lock:
+                seq, until = self.watch_seq, self.watch_until
+            if time.monotonic() > until:
+                self.watch.clear()
+                continue
+            if user32.GetClipboardSequenceNumber() == seq:
+                continue
+            time.sleep(0.3)  # let the Snipping Tool finish writing every format
+            with self.lock:
+                if self.watch_until != until:
+                    continue  # pressed again meanwhile: wait for that snip instead
+                self.watch.clear()
+            if any(user32.IsClipboardFormatAvailable(f) for f in CLIPBOARD_IMAGE_FORMATS):
+                emit(event="snip_ready", source="snipping")
+
+
+snip = SnipGesture()
+_hook_jobs = queue.Queue()  # mouse-hook installs and removals, kept off the hook threads
+
+
+def mouse_wanted():
+    return ptt.wants_mouse() or snip.state == SnipGesture.ARMED
+
+
+def run_hook_jobs():
+    while True:
+        _hook_jobs.get()
+        if HOOKS:
+            mouse_hook.sync(mouse_wanted())
+
+
+CF_DIB, GMEM_MOVEABLE, HWND_MESSAGE = 8, 0x0002, wt.HWND(-3)
+kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
+kernel32.GlobalAlloc.restype = wt.HGLOBAL
+kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
+kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
+user32.OpenClipboard.argtypes = [wt.HWND]
+user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
+user32.SetClipboardData.restype = wt.HANDLE
+user32.RegisterClipboardFormatW.argtypes = [wt.LPCWSTR]
+user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID]
+user32.CreateWindowExW.restype = wt.HWND
+user32.DestroyWindow.argtypes = [wt.HWND]
+
+
+def put_image_on_clipboard(image):
+    """Copy an image the way the Snipping Tool does: PNG (which latest_screenshot reads first)
+    plus a DIB for apps that only paste bitmaps. Done here because Electron's clipboard.writeImage
+    hangs the widget's main process on this laptop (Electron 44.9.3, 3 Nov; text writes work)."""
+    import io
+    png, dib = io.BytesIO(), io.BytesIO()
+    image.save(png, "PNG")
+    image.convert("RGB").save(dib, "DIB")
+    formats = ((user32.RegisterClipboardFormatW("PNG"), png.getvalue()), (CF_DIB, dib.getvalue()))
+    # The clipboard needs an owner window for SetClipboardData; a message-only one is enough.
+    owner = user32.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, HWND_MESSAGE, None, None, None)
+    try:
+        for _ in range(20):  # another app may have it open for a moment
+            if user32.OpenClipboard(owner):
+                break
+            time.sleep(0.05)
+        else:
+            raise OSError("the clipboard is busy")
+        try:
+            user32.EmptyClipboard()
+            for fmt, data in formats:
+                handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                ctypes.memmove(kernel32.GlobalLock(handle), data, len(data))
+                kernel32.GlobalUnlock(handle)
+                if not user32.SetClipboardData(fmt, handle):  # on success the clipboard owns it
+                    kernel32.GlobalFree(handle)
+                    raise OSError(f"SetClipboardData failed: error {ctypes.get_last_error()}")
+        finally:
+            user32.CloseClipboard()
+    finally:
+        if owner:
+            user32.DestroyWindow(owner)
+
+
+MAX_SNIP_POINTS = 5000
+
+
+def cut_out(image, points, left, top):
+    """Keep what is inside the traced shape (closed back to its start) and turn the rest white,
+    as the Snipping Tool's freeform mode does. points are screen pixels; (left, top) is the
+    image's top-left corner on the screen."""
+    from PIL import Image, ImageDraw
+    mask = Image.new("L", image.size, 0)
+    ImageDraw.Draw(mask).polygon([(x - left, y - top) for x, y in points], fill=255, outline=255)
+    return Image.composite(image.convert("RGB"), Image.new("RGB", image.size, "white"), mask)
+
+
+def grab(cmd):
+    """A freeform shape ("points") or a rectangle ("rect") of the screen, in physical pixels, put
+    on the clipboard for the twin's latest_screenshot tool; nothing is written to disk."""
+    try:
+        from PIL import ImageGrab
+        points = None
+        if "points" in cmd:
+            points = [(int(x), int(y)) for x, y in cmd["points"]][:MAX_SNIP_POINTS]
+            if len(points) < 3:
+                raise ValueError("the trace is too short")
+            xs, ys = [x for x, _ in points], [y for _, y in points]
+            left, top, right, bottom = min(xs), min(ys), max(xs) + 1, max(ys) + 1
+        else:
+            left, top, right, bottom = (int(v) for v in cmd["rect"])
+        if right - left < 4 or bottom - top < 4:
+            raise ValueError("the selection is too small")
+        image = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
+        if points:
+            image = cut_out(image, points, left, top)
+        put_image_on_clipboard(image)
+        emit(event="grabbed", id=cmd.get("id"), ok=True, width=image.width, height=image.height)
+    except Exception as exc:
+        emit(event="grabbed", id=cmd.get("id"), ok=False, error=f"{type(exc).__name__}: {exc}")
+
+
 def _message_loop():
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -319,6 +558,8 @@ def run_hook():
         if n_code == 0:
             kb = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             try:
+                if not kb.flags & LLKHF_INJECTED:
+                    snip.key(w_param, kb)  # watches only; never swallows
                 if ptt.handle(w_param, kb):
                     return 1
             except Exception as exc:  # never let an error kill keyboard input
@@ -333,25 +574,30 @@ def run_hook():
 
 
 class MouseHook:
-    """The mouse hook runs only while a side button is the talk key or a capture is waiting: it is
-    called for every mouse move, and costs nothing when it isn't installed."""
+    """The mouse hook runs only while a side button is the talk key, a capture is waiting or Ctrl
+    is held for a snip: it is called for every mouse move, and costs nothing when it isn't
+    installed. Installed and removed from one thread (run_hook_jobs), never from a hook."""
 
     def __init__(self):
         self.thread_id = None
         self.proc = None
+        self.lock = threading.Lock()
 
     def sync(self, wanted):
-        if wanted and self.thread_id is None:
-            self._start()
-        elif not wanted and self.thread_id is not None:
-            tid, self.thread_id = self.thread_id, None
-            user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+        with self.lock:
+            if wanted and self.thread_id is None:
+                self._start()
+            elif not wanted and self.thread_id is not None:
+                tid, self.thread_id = self.thread_id, None
+                user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
 
     def _start(self):
         ready = threading.Event()
 
         @HOOKPROC
         def proc(n_code, w_param, l_param):
+            if n_code == 0 and w_param in SNIP_CANCELS:
+                snip.mouse()  # Ctrl+click or Ctrl+scroll: not a snip; the event goes on as usual
             if n_code == 0 and (w_param == WM_XBUTTONDOWN or w_param == WM_XBUTTONUP):
                 ms = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                 try:
@@ -451,11 +697,13 @@ FULLSCREEN_STATES = {2, 3, 4, 7}
 
 
 def run_fullscreen_watch():
+    global _fullscreen
     shell32 = ctypes.WinDLL("shell32")
     state = ctypes.c_int()
     last = None
     while True:
         busy = shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0 and state.value in FULLSCREEN_STATES
+        _fullscreen = busy
         if busy != last:
             emit(event="fullscreen", busy=busy)
             last = busy
@@ -484,8 +732,23 @@ def run_transcriber():
              ms=round((time.perf_counter() - t0) * 1000))
 
 
+def _private_stdin():
+    """Commands arrive on stdin, but child processes must not inherit that pipe: Hermes's import
+    runs `git` (version_info), and on Windows a child sharing a pipe this process is blocked
+    reading from waits until the widget writes a line, so the speech model never loaded. Read
+    from a private copy and point the standard input at NUL."""
+    commands = open(os.dup(0), encoding="utf-8", errors="replace")
+    nul = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(nul, 0)
+    os.close(nul)
+    return commands
+
+
+_commands_in = None
+
+
 def run_commands():
-    for line in sys.stdin:
+    for line in _commands_in:
         try:
             cmd = json.loads(line)
         except ValueError:
@@ -498,8 +761,11 @@ def run_commands():
             restore_focus()
         elif cmd.get("cmd") == "configure":
             ptt.configure(cmd.get("talk"), cmd.get("hold_ms"))
-            if HOOKS:
-                mouse_hook.sync(ptt.wants_mouse())
+            if "snip" in cmd:
+                snip.enabled = cmd["snip"] is not False
+            _hook_jobs.put(None)
+        elif cmd.get("cmd") == "grab":
+            threading.Thread(target=grab, args=(cmd,), daemon=True).start()
         elif cmd.get("cmd") == "capture":
             if cmd.get("cancel"):
                 ptt.cancel_capture()
@@ -507,7 +773,7 @@ def run_commands():
                 emit(event="captured", cancelled=True)
             else:
                 ptt.capture()
-                mouse_hook.sync(True)
+                _hook_jobs.put(None)
     os._exit(0)  # widget closed our stdin
 
 
@@ -538,15 +804,21 @@ HOOKS = "--no-hook" not in sys.argv
 
 
 def main():
+    global _commands_in
+    _commands_in = _private_stdin()
     threading.Thread(target=_writer, daemon=True).start()
     try:
         start = json.loads(os.environ.get("STUDENT_TWIN_VOICE") or "{}")
     except ValueError:
         start = {}
     ptt.configure(start.get("talk"), start.get("hold_ms"))
+    snip.enabled = start.get("snip", True) is not False
     if HOOKS:
         threading.Thread(target=run_hook, daemon=True).start()
-        mouse_hook.sync(ptt.wants_mouse())
+        mouse_hook.sync(mouse_wanted())
+    threading.Thread(target=run_hook_jobs, daemon=True).start()
+    threading.Thread(target=snip.watchdog, daemon=True).start()
+    threading.Thread(target=snip.clipboard_watch, daemon=True).start()
     threading.Thread(target=run_focus_tracker, daemon=True).start()
     threading.Thread(target=run_fullscreen_watch, daemon=True).start()
     # Commands are read from the start, so a settings change or a capture needn't wait for the model.

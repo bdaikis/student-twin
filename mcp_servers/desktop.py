@@ -1143,6 +1143,30 @@ def ui_type(window: str, element: str, text: str, press_enter: bool = False) -> 
     return f"Typed into {kind} '{name}' in {win['title']!r}" + (" and pressed Enter." if press_enter else ".")
 
 
+# --- User's screenshot (Win+Shift+S copies an image to the clipboard) ------------------------
+
+@server.tool()
+def latest_screenshot():
+    """Read the image the user just copied with Windows Snipping Tool / Win+Shift+S. Use when
+    asked to explain, read, solve or answer a question about their latest screenshot or snip.
+    Returns the actual clipboard image to see diagrams, equations and text, not just OCR.
+    Never takes a new screen capture, opens files or changes the clipboard. If the clipboard
+    has no image, ask the user to snip again; never guess from an older image in the conversation.
+    Follow-up questions use the image already returned; read again only for a new screenshot.
+    The clipboard is on THIS computer; never assume it belongs to a different device.
+    """
+    from mcp.server.mcpserver import Image
+    from screenshots import ClipboardScreenshotError, read_clipboard_screenshot
+
+    if (locked := _locked()):
+        return locked
+    try:
+        shot = read_clipboard_screenshot()
+    except ClipboardScreenshotError as exc:
+        return str(exc)
+    return [shot.note, Image(data=shot.data, format=shot.format)]
+
+
 # --- Screen control (step 2d-iii, layer 3): look at a window, then click, type or scroll ---------
 # For what the accessibility tree can't reach: canvas and game content, apps with poor labels,
 # visual questions. A look is a screenshot of one window, never the whole screen and never a

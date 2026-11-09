@@ -117,6 +117,42 @@ machines polling one bot split its messages between them, and both would send ev
 - Send your bot a message on Telegram, then `/new` after any change to tools or settings.
 - Ask "what's due this week?" in both places.
 
+### Snip and ask
+
+Hold **Ctrl** on its own and move the pointer around what you want: a line follows the pointer from
+where Ctrl went down. Releasing Ctrl closes the shape with a straight line back to the start (shown
+dashed while you draw) and sends what is inside it to the twin; outside the shape comes out white.
+The trace stays on the screen where it started. A **Win+Shift+S** snip goes to the twin
+the same way once it reaches the clipboard. The twin solves a maths or physics problem straight
+away; for anything else it says what it sees and asks what you want done with it. Answer by voice
+or by typing.
+
+Ctrl used for a shortcut doesn't snip: pressing another key, clicking or scrolling while Ctrl is
+down cancels it, and so does a movement under 8 px or a shape under 12 px across. Nothing is
+swallowed, so Ctrl+C and Ctrl+click work as before. It stays off while a full-screen app is in
+front or the pointer is hidden (games hold Ctrl to crouch or sprint). The Ctrl snip is put on the
+clipboard, as the Snipping Tool does. Turn both off with *Snips go to the twin* in the settings.
+
+### Ask about a screenshot
+
+With *Snips go to the twin* off, press **Win+Shift+S**, select the problem, diagram or text, then
+ask the widget by voice or typing:
+"Explain my latest screenshot" or "Solve the question I just screenshotted." No paste or file save
+is needed. The `latest_screenshot` desktop tool reads the current clipboard image and gives that
+image to the model; follow-up questions use the same image in the conversation. Take another snip
+and say "Solve my new screenshot" to change it.
+
+Only the image currently on the clipboard is available. If you copy text or a file afterwards,
+snip again. The twin never replaces it with a new capture of your screen and asks for a clearer
+snip when it cannot read the question. Image contents are sent to the configured model provider
+when the tool is called and may remain in Hermes's conversation history; the tool creates no
+separate image archive and leaves the clipboard untouched. It reads this computer's clipboard:
+from Telegram, that is the computer running the desktop server. Laptop-to-desktop routing is
+still part of the desktop host plan.
+
+After updating from an earlier version, restart Hermes so it reloads the desktop server and
+restart the widget for its new screenshot guidance. Send `/new` on Telegram so both channels see the new tool.
+
 ### Moving to another computer
 
 `scripts\transfer_state.py export <folder>` copies the twin's settings (shared rules, memory, the

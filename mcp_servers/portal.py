@@ -13,15 +13,15 @@ twin never checks in on its own initiative, on a schedule, or for a class that i
 import json
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from mcp.server.mcpserver import MCPServer
 
 import course_files
 import deadlines as dl
 import timetable
-from common import (DATA, PRESENT, course_contents, course_id, match_course, moodle, remember_sessions,
-                    remembered_session, session_for, totals_verdict)
+from common import (DATA, PRESENT, course_contents, course_id, is_announcement_forum, match_course, moodle,
+                    post_text, remember_sessions, remembered_session, session_for, totals_verdict)
 
 server = MCPServer(
     "portal",
@@ -29,7 +29,7 @@ server = MCPServer(
         "Bhanu's university timetable, course material and attendance on SPeCTRUM (UM's Moodle). "
         "When he says he is in class (\"here\", \"I'm here\", \"check me in\", \"mark me\"), usually in "
         "reply to a class reminder, call mark_attendance. For whether he has been marked today, call "
-        "attendance_today."
+        "attendance_today. For announcements or what a lecturer posted, call announcements."
     ),
 )
 
@@ -177,6 +177,62 @@ def course_materials(course: str) -> str:
         for m in sec["modules"]:
             files = f" (files: {', '.join(m['files'][:4])}{'…' if len(m['files']) > 4 else ''})" if m["files"] else ""
             lines.append(f"- [{m['type']}] {m['name']}{files}")
+    return "\n".join(lines)
+
+
+# Lecturers write "tomorrow's class is online": the day that means, counted from the post's date.
+RELATIVE_DAYS = (("today", 0), ("tonight", 0), ("tomorrow", 1), ("hari ini", 0), ("esok", 1))
+
+
+@server.tool()
+def announcements(course: str = "", days: int = 14) -> str:
+    """Posts in Bhanu's course announcement forums on SPeCTRUM from the last `days` days (default 14),
+    newest first, with each post's date, title and text. It reads each course's Announcements forum
+    and any forum a lecturer named for announcements. `course` is a code or part of a name; empty
+    means every course. Use it for "any announcements?" and "what did the lecturer say?", and also when
+    he asks whether a class is on, online or where: lecturers post changes here (online, cancelled,
+    moved) that the timetable doesn't show. course_materials only lists a forum's name."""
+    from moodle import MoodleError
+    courses = dl._courses()
+    if course:
+        got = match_course(course)
+        if isinstance(got, str):
+            return got
+        courses = {cid: code for cid, code in courses.items() if code == got[0]}
+    if not courses:
+        return "No course pages are set up in the twin's config."
+    m = moodle()
+    since = int(time.time()) - max(days, 1) * 86400
+    try:
+        forums = [f for f in m.call("mod_forum_get_forums_by_courses",
+                                    **{f"courseids[{i}]": c for i, c in enumerate(courses)})
+                  if is_announcement_forum(f)]
+        posts = []
+        for f in forums:
+            for d in m.call("mod_forum_get_forum_discussions", forumid=f["id"], sortorder=1,
+                            perpage=10).get("discussions", []):
+                at = d.get("created") or d.get("timemodified") or 0
+                if at >= since:
+                    posts.append((at, courses.get(f["course"], "?"), f["name"], d))
+    except MoodleError as exc:
+        return f"Couldn't read SPeCTRUM's forums just now: {exc}"
+    where = f" in {next(iter(courses.values()))}" if course else ""
+    if not posts:
+        return f"No announcements{where} in the last {days} days."
+    lines = [f"Announcements{where}, last {days} days, newest first:"]
+    for at, code, forum, d in sorted(posts, key=lambda p: -p[0]):
+        text = post_text(d.get("message", ""))
+        files = [a.get("filename") for a in d.get("attachments") or [] if a.get("filename")]
+        subject = d.get("subject", "").strip()
+        posted = datetime.fromtimestamp(at, timetable.LOCAL)
+        days_named = [f'"{w}" = {posted + timedelta(days=n):%a %d %b}' for w, n in RELATIVE_DAYS
+                      if re.search(rf"(?i)\b{w}\b", f"{subject} {text}")]
+        lines.append(f"- {code}, {datetime.fromtimestamp(at, timetable.LOCAL):%a %d %b %H:%M}, "
+                     f"{d.get('userfullname', '').strip(' .') or 'unknown'} in {forum!r}: {subject}"
+                     + (f"{'' if subject[-1:] in '.!?' else '.'} {text[:700]}{'…' if len(text) > 700 else ''}"
+                        if text else "")
+                     + (f" (attached: {', '.join(files)})" if files else "")
+                     + (f" [in this post {', '.join(days_named)}]" if days_named else ""))
     return "\n".join(lines)
 
 

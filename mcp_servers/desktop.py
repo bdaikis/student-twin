@@ -965,7 +965,7 @@ _UI_KINDS = {"ButtonControl": "button", "HyperlinkControl": "link", "MenuItemCon
 _ACTIONABLE = {"button", "link", "menu item", "list item", "tab", "tree item", "checkbox", "radio button", "row"}
 
 
-# --- Locked laptop (2026-10-24): Telegram requests can arrive while the screen is locked, when
+# --- Locked screen (2026-10-24): Telegram requests can arrive while the screen is locked, when
 # Windows lets no program read or drive it. Screen tools say so at once instead of failing halfway.
 
 def _locked() -> str | None:
@@ -982,7 +982,7 @@ def _locked() -> str | None:
     except Exception:
         return None
     if flags == 0:
-        return ("Bhanu's laptop is locked, so nothing on its screen can be read or done; "
+        return ("Bhanu's computer is locked, so nothing on its screen can be read or done; "
                 "tell him to unlock it and ask again.")
     return None
 
@@ -1574,7 +1574,7 @@ async def pick_files(folder: str, pattern: str = "*", recursive: bool = False, n
 @server.tool()
 def send_screenshot(window: str) -> str:
     """Save a screenshot of one window so it can be sent to Bhanu on Telegram, where he can't see the
-    laptop: put the returned MEDIA line on its own line in the reply. Use after a request that changed
+    computer: put the returned MEDIA line on its own line in the reply. Use after a request that changed
     something on screen. Not on the widget (he sees the screen), never messaging windows."""
     win, err = _ui_window(window)
     if err:

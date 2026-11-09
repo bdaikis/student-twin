@@ -5,7 +5,9 @@ deadlines that come from course forms or that Bhanu added (the portal doesn't ha
     python scripts\\eval_deadlines.py [questions.json]
 
 Questions live in the per-user data folder (<data>/evals/deadline_questions.json), since they name
-his courses. Each is asked in a fresh Hermes session with no hints, as Telegram would ask it:
+his courses. Each is asked in a fresh Hermes session with no hints, as Telegram would ask it. Hermes
+keys a session on the first message unless told otherwise, so without a session id of its own every
+run reused the question's session from earlier runs (found 10 Nov 2026); each now gets a new one:
   {"q": "...", "type": "items", "days": 7}               every item due in the next N days is named with its date
   {"q": "...", "type": "next"}                           the soonest unsubmitted item still to come is named with its date
   {"q": "...", "type": "item", "course": "X", "title": "Y"}  that item is named with its date
@@ -20,7 +22,7 @@ import re
 import sys
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mcp_servers"))
@@ -53,32 +55,40 @@ def key_items(now: int) -> list[dict]:
                           "kind": "quiz", "done": any(a.get("state") == "finished" for a in att)})
     db = dl._connect()
     try:
-        for r in db.execute("SELECT course, title, due, kind FROM items WHERE source != 'spectrum'"):
-            items.append({"course": r["course"], "title": r["title"], "due": r["due"], "kind": r["kind"], "done": False})
+        for r in db.execute("SELECT course, title, due, kind, precision FROM items WHERE source != 'spectrum'"):
+            items.append({"course": r["course"], "title": r["title"], "due": r["due"], "kind": r["kind"], "done": False,
+                          "precision": r["precision"]})
     finally:
         db.close()
     return items
 
 
-def ask(question: str) -> str:
+def ask(question: str, session: str | None = None) -> str:
     key = next(l.split("=", 1)[1].strip() for l in ENV.read_text(encoding="utf-8").splitlines()
                if l.startswith("API_SERVER_KEY="))
     body = json.dumps({"model": "hermes-agent", "stream": False,
                        "messages": [{"role": "user", "content": question}]}).encode()
-    req = urllib.request.Request(HERMES, data=body, headers={"Authorization": f"Bearer {key}",
-                                                             "Content-Type": "application/json"})
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if session:
+        headers["X-Hermes-Session-Id"] = session
+    req = urllib.request.Request(HERMES, data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=300) as r:
         return json.load(r)["choices"][0]["message"]["content"]
 
 
+def _named(answer: str, item: dict) -> bool:
+    """The answer names the item: its course or a distinctive title word."""
+    a = answer.lower()
+    words = [w for w in re.findall(r"[a-z0-9&]+", item["title"].lower()) if len(w) > 3]
+    return item["course"].lower() in a or any(w in a for w in words)
+
+
 def mentions(answer: str, item: dict) -> bool:
-    """The answer names the item (its course or a distinctive title word) and its date."""
+    """The answer names the item and its date."""
     a = answer.lower()
     d = datetime.fromtimestamp(item["due"], timetable.LOCAL)
     dates = {f"{d.day} {d:%b}".lower(), f"{d.day} {d:%B}".lower(), f"{d:%b} {d.day}".lower(), f"{d:%B} {d.day}".lower()}
-    words = [w for w in re.findall(r"[a-z0-9&]+", item["title"].lower()) if len(w) > 3]
-    named = item["course"].lower() in a or any(w in a for w in words)
-    return named and any(x in a for x in dates)
+    return _named(answer, item) and any(x in a for x in dates)
 
 
 def _dates(text: str, year: int):
@@ -96,8 +106,13 @@ def score(q: dict, answer: str, items: list[dict], now: int) -> tuple[bool, str]
     if t == "none":
         # A future date counts as inventing a deadline unless it's the date of a real item the answer
         # names ("no SIF1017 exam; Tutorial 1 is due 2 Nov" is right). "As of Tue 20 Oct" or a past item is fine.
+        # A week-only item (a course form's "week 7") may be given by any day of its week, as "the week of 23 Nov".
         today = datetime.fromtimestamp(now, timetable.LOCAL).date()
-        real = {datetime.fromtimestamp(i["due"], timetable.LOCAL).date() for i in items if mentions(answer, i)}
+        real = set()
+        for i in items:
+            if mentions(answer, i) or (i.get("precision") == "week" and _named(answer, i)):
+                due = datetime.fromtimestamp(i["due"], timetable.LOCAL).date()
+                real |= {due - timedelta(days=k) for k in range(7 if i.get("precision") == "week" else 1)}
         dated = any(d > today and d not in real for d in _dates(answer, today.year))
         nothing = re.search(r"(?i)\bno(thing| deadlines?| assignments?| tests?)?\b|isn't|aren't|don't see|not (find|listed|on)", answer)
         return bool(nothing) and not dated, "says nothing, no dates" if nothing and not dated else "named a date or didn't say none"
@@ -128,9 +143,10 @@ def main() -> None:
     if stale:
         sys.exit("Stale questions; replace them with items still to come, then rerun:\n  " + "\n  ".join(stale))
     results = []
-    for q in questions:
+    run = time.strftime("%Y%m%d-%H%M%S")
+    for n, q in enumerate(questions, 1):
         t0 = time.time()
-        answer = ask(q["q"])
+        answer = ask(q["q"], f"eval-deadlines-{run}-{n}")
         ok, why = score(q, answer, items, now)
         results.append({**q, "answer": answer, "pass": ok, "why": why, "seconds": round(time.time() - t0, 1)})
         print(f"{'PASS' if ok else 'FAIL'}  {q['q']}  ({why}, {results[-1]['seconds']} s)")

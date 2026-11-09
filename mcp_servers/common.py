@@ -4,6 +4,7 @@ Per-user settings live outside the repo in %LOCALAPPDATA%\\student-twin\\config.
 STUDENT_TWIN_HOME): the portal URL, the courses' portal pages, browser profiles, music, home city
 and protected folders.
 """
+import html
 import json
 import os
 import re
@@ -179,11 +180,25 @@ def match_course(course: str) -> tuple[str, dict] | str:
     for code, info in courses.items():
         if q and (q == code.lower() or q in code.lower()):
             return code, info
-    hits = [code for code, info in courses.items() if norm(course) and norm(course) in norm(info["name"])]
+    name = norm(course)
+    hits = [code for code, info in courses.items() if name and name in norm(info["name"])]
+    if not hits and name.endswith("s"):  # "maths" for Mathematical Methods
+        hits = [code for code, info in courses.items() if name[:-1] in norm(info["name"])]
     if len(hits) == 1:
         return hits[0], courses[hits[0]]
     known = ", ".join(f"{c} ({i['name']})" for c, i in courses.items())
     return f"No single course matches {course!r}. Courses: {known}."
+
+
+def is_announcement_forum(forum: dict) -> bool:
+    """A course's built-in Announcements (news) forum, or an ordinary forum a lecturer named for
+    announcements: SIF1017 has no news forum and posts in "Announcements (PLEASE READ)"."""
+    return forum.get("type") == "news" or bool(re.search(r"(?i)announce|pengumuman", forum.get("name", "")))
+
+
+def post_text(message: str) -> str:
+    """A forum post's HTML as one line of plain text."""
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", message or "")).split())
 
 
 def course_id(info: dict) -> int | None:

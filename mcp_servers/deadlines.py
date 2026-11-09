@@ -321,14 +321,16 @@ def describe_due(due: int, precision: str, now: datetime | None = None) -> str:
 
 
 def upcoming(days: int = 7, course: str = "", include_done: bool = False) -> list[dict]:
-    """Items due from 14 days ago (overdue) up to `days` ahead, soonest first."""
+    """Items due from now up to `days` ahead, soonest first. Once an item's date has passed it is
+    never shown again, submitted or not (Bhanu, 9 Nov 2026); the row stays in the store so the
+    deadline watch doesn't announce it as new on the next SPeCTRUM read."""
     now = int(time.time())
     db = _connect()
     try:
         rows = [dict(r) for r in db.execute(
             "SELECT * FROM items WHERE removed IS NULL AND due IS NOT NULL AND due BETWEEN ? AND ? "
             "AND key NOT IN (SELECT key FROM dismissed) ORDER BY due",
-            (now - 14 * 86400, now + days * 86400))]
+            (now, now + days * 86400))]
     finally:
         db.close()
     if course:

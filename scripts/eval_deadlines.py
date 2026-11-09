@@ -9,10 +9,10 @@ his courses. Each is asked in a fresh Hermes session with no hints, as Telegram 
   {"q": "...", "type": "items", "days": 7}               every item due in the next N days is named with its date
   {"q": "...", "type": "next"}                           the soonest unsubmitted item still to come is named with its date
   {"q": "...", "type": "item", "course": "X", "title": "Y"}  that item is named with its date
-  {"q": "...", "type": "overdue"}                        every overdue unsubmitted assignment or quiz is named
   {"q": "...", "type": "none"}                           the answer says there's nothing, and names no made-up date
-The run refuses to start while an item question is stale (its item is one the twin hides: done and
-closed, or due over 14 days ago), so a pass is about deadlines as they stand that day.
+The run refuses to start while a question is stale: an item question whose item's date has passed
+(the twin drops those, Bhanu 9 Nov 2026), or an "overdue" question, which the twin no longer answers.
+So a pass is about deadlines as they stand that day.
 Results are printed and saved to <data>/evals/.
 """
 import json
@@ -104,16 +104,16 @@ def score(q: dict, answer: str, items: list[dict], now: int) -> tuple[bool, str]
     if t == "items":
         want = [i for i in items if now <= i["due"] <= now + q.get("days", 7) * 86400 and not i["done"]]
     elif t == "overdue":
-        want = [i for i in items if i["due"] < now and not i["done"] and i["kind"] in ("assignment", "quiz")]
+        return False, "stale: the twin no longer reports overdue items (9 Nov 2026)"
     elif t == "next":
         ahead = [i for i in items if i["due"] >= now and not i["done"]]
         first = min((i["due"] for i in ahead), default=None)
         want = [i for i in ahead if i["due"] == first]
     else:
         want = [i for i in items if i["course"] == q["course"] and q["title"].lower() in i["title"].lower()]
-        # deadlines.upcoming() hides these, so the twin can't know them: replace the question.
-        if want and all(i["due"] < now - 14 * 86400 or (i["due"] < now and i["done"]) for i in want):
-            return False, "stale: the twin hides this item now (closed and done, or over 14 days ago)"
+        # deadlines.upcoming() drops an item once its date has passed: replace the question.
+        if want and all(i["due"] < now for i in want):
+            return False, "stale: its date has passed, so the twin no longer shows it"
     missed = [f"{i['course']} {i['title']}" for i in want if not mentions(answer, i)]
     return not missed and bool(want), (f"missed: {'; '.join(missed)}" if missed
                                        else f"all {len(want)} named" if want else "not in the key")

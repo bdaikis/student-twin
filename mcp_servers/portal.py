@@ -77,12 +77,14 @@ def now() -> str:
 
 @server.tool()
 def deadlines(days: int = 7, course: str = "") -> str:
-    """What Bhanu has to hand in or sit: anything overdue that he hasn't submitted, then everything due
-    in the next `days` days (default 7), soonest first. Covers SPeCTRUM (assignments with his submission
+    """What Bhanu has to hand in or sit: everything due in the next `days` days (default 7), soonest
+    first, then briefly what comes later this semester. Covers SPeCTRUM (assignments with his submission
     status, quizzes with his attempts, other due items), tests and dates from the course-information
     forms, and deadlines he added himself. `course` narrows it to one course. Use it for "what's due
-    this week", "what's overdue", "anything for SIF1006", and "when is X due" (pass days=150 so later
-    items are included). Always check here before saying something is or isn't due."""
+    this week", "anything for SIF1006", and "when is X due" (pass days=150 so later items are
+    included). Always check here before saying something is or isn't due. Nothing whose date has
+    passed is kept: for "what's overdue" or a test that already happened, say the twin only tracks
+    what is still to come."""
     note = ""
     try:
         dl.refresh()
@@ -91,22 +93,14 @@ def deadlines(days: int = 7, course: str = "") -> str:
     now = timetable.now()
     ts = int(now.timestamp())
     rows = dl.upcoming(max(1, min(int(days), 200)), course)
-    # Overdue means something he can still hand in: assignments and quizzes SPeCTRUM shows as not done.
-    # A forum due date passes without SPeCTRUM saying whether he posted; a past test simply happened.
-    overdue = [r for r in rows if r["due"] < ts and r["kind"] in ("assignment", "quiz") and r["status"] not in dl.DONE]
-    unknown = [r for r in rows if r["due"] < ts and r["kind"] in ("forum", "other") and r["due"] > ts - 7 * 86400]
+    # Only what is still to come: past items are dropped, submitted or not (Bhanu, 9 Nov 2026).
     soon = [r for r in rows if r["due"] >= ts]
     scope = f" for {course}" if course.strip() else ""
     parts = [f"As of {now:%a %d %b %H:%M}{scope}:"]
-    if overdue:
-        parts.append("Overdue and not submitted:\n" + "\n".join(f"- {dl.line(r, now)}" for r in overdue))
-    if unknown:
-        parts.append("Past due in the last week; SPeCTRUM doesn't show whether these were done:\n" + "\n".join(
-            f"- {dl.line(r, now)}" for r in unknown))
     if soon:
         parts.append(f"Due in the next {days} days:\n" + "\n".join(f"- {dl.line(r, now)}" for r in soon))
-    if not overdue and not soon:
-        parts.append(f"Nothing due in the next {days} days, and nothing overdue.")
+    else:
+        parts.append(f"Nothing due in the next {days} days.")
     # Always show what lies beyond the window, briefly: a question about a later item ("when is
     # Project 2 due?") must not get "not found" because the window was a week (eval, 20 Oct 2026).
     shown = {r["key"] for r in rows}

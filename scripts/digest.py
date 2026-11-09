@@ -3,8 +3,8 @@ call; whatever this prints is sent to Bhanu on Telegram.
 
     hermes cron create "0 7,21 * * *" --no-agent --script digest.py --deliver telegram --name digest
 
-Morning: today's classes. Evening: tomorrow's. Both: anything overdue and not submitted, what's due
-in the next 7 days (SPeCTRUM read first), and what changed since the last digest. Sent every day,
+Morning: today's classes. Evening: tomorrow's. Both: what's due in the next 7 days, nothing whose
+date has passed (SPeCTRUM read first), and what changed since the last digest. Sent every day,
 so a missing digest means something broke. After the laptop has slept through a slot, a digest is
 still sent if it is less than three hours late; each slot is sent once.
 """
@@ -69,10 +69,7 @@ def compose(now: datetime, slot: str, since: int, refresh_note: str = "") -> str
         lines.append(f"- Timetable unavailable: {exc}")
     ts = int(now.timestamp())
     rows = dl.upcoming(7)
-    overdue = [r for r in rows if r["due"] < ts and r["kind"] in ("assignment", "quiz") and r["status"] not in dl.DONE]
     soon = [r for r in rows if r["due"] >= ts]
-    if overdue:
-        lines += ["", "Overdue, not submitted:"] + [f"- {dl.line(r, now)}" for r in overdue]
     lines += ["", "Due in the next 7 days:"] + ([f"- {dl.line(r, now)}" for r in soon] or ["- Nothing."])
     db = dl._connect()
     try:

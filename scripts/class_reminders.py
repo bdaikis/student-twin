@@ -6,9 +6,14 @@ Whatever this prints is sent to Bhanu on Telegram; printing nothing sends nothin
 
 - When a class starts: a reminder. For a lecture with SPeCTRUM attendance, SPeCTRUM is read first:
   if it already shows him marked, the reminder says so; otherwise "reply 'here' and I'll check you
-  in". For a lab, "taken in person". A course with no SPeCTRUM attendance gets no reminder. Bhanu's
-  rules (2026-10-19): always check SPeCTRUM before telling him he hasn't marked his attendance, and
-  no reminders to sign the paper sheet.
+  in". For a lab, "taken in person". A course with no SPeCTRUM attendance gets no reminder unless
+  it has an announcement about that day. Bhanu's rules (2026-10-19): always check SPeCTRUM before
+  telling him he hasn't marked his attendance, and no reminders to sign the paper sheet.
+- Every start reminder reads the course's announcements first (Bhanu, 2026-11-10: SIF1017 was
+  moved online by announcement and the reminder still said DKFIZIK). Posts about that day are
+  quoted under it, and if the newest says the class is online, the reminder says online. Hermes
+  records these messages in the Telegram conversation (the job's attach_to_session), so a "here"
+  in reply reaches a twin that knows which class it was.
 - 15 minutes in: unless SPeCTRUM already shows him present for that session, a second message
   while there is still time to check in (or saying what SPeCTRUM recorded instead, such as Absent).
   Decided by the session's status, not the totals: a lecturer taking the register with him absent
@@ -27,8 +32,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mcp_servers"))
 
 import timetable  # noqa: E402
-from common import (DATA, PRESENT, course_id, match_course, moodle, remember_sessions,  # noqa: E402
-                    remembered_session, session_for, totals_verdict)
+from common import (DATA, PRESENT, announcement_posts, class_announcements, course_id,  # noqa: E402
+                    match_course, moodle, remember_sessions, remembered_session, session_for, totals_verdict)
 
 STATE = DATA / "reminders_state.json"
 SNAPSHOTS = DATA / "attendance_snapshots"
@@ -60,9 +65,22 @@ def snapshot(code: str, cid: int, cmids) -> None:
         path.write_text(json.dumps(page, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def heading(b) -> str:
-    where = "online" if b.online else b.location
+def heading(b, where: str | None = None) -> str:
+    where = where or ("online" if b.online else b.location)
     return f"{b.code} {b.name.title()} {b.activity.lower()}, {where}, {b.start:%H:%M}–{b.end:%H:%M}."
+
+
+def announced(b, cid) -> tuple[str | None, list[str]]:
+    """Where the class is and the course's announcements about its day; the timetable's room and a
+    note when SPeCTRUM's forums can't be read."""
+    try:
+        return class_announcements(b, announcement_posts({cid: b.code}) if cid else [])
+    except Exception:
+        return None, ["(Couldn't read the course's announcements just now.)"]
+
+
+def message(first: str, notes: list[str]) -> str:
+    return "\n".join([first, *notes])
 
 
 def main() -> None:
@@ -74,23 +92,26 @@ def main() -> None:
             continue
         key = f"{b.code}-{b.start.isoformat()}"
         entry = state.setdefault(key, {"start": b.start.isoformat()})
-        if b.activity == "LAB":
-            if not entry.get("reminded"):
-                messages.append(f"{heading(b)} Lab attendance is taken in person.")
-                entry["reminded"] = True
-            continue
         match = match_course(b.code)
         cid = course_id(match[1]) if not isinstance(match, str) else None
+        if b.activity == "LAB":
+            if not entry.get("reminded"):
+                where, notes = announced(b, cid)
+                messages.append(message(f"{heading(b, where)} Lab attendance is taken in person.", notes))
+                entry["reminded"] = True
+            continue
         if not entry.get("reminded"):
             if now - b.start > CATCH_UP:
                 entry["reminded"] = entry["followed_up"] = True  # started too long ago to be useful
                 continue
+            where, notes = announced(b, cid)
             try:
                 acts = [a for a in moodle().attendance(cid, fresh=True)
                         if dict(a["rows"]).get("Total number of sessions") != "0"] if cid else []
                 remember_sessions(b.code, acts)
             except Exception as exc:
-                messages.append(f"{heading(b)} I couldn't reach SPeCTRUM ({exc}); check in yourself.")
+                messages.append(message(f"{heading(b, where)} I couldn't reach SPeCTRUM ({exc}); check in yourself.",
+                                        notes))
                 entry["reminded"] = entry["followed_up"] = True
                 continue
             entry["before"] = {str(a["cmid"]): dict(a["rows"]) for a in acts}
@@ -99,16 +120,19 @@ def main() -> None:
             session = session_for(b, acts)
             status = session["status"] if session else ""
             if not acts:
-                entry["followed_up"] = True  # no SPeCTRUM attendance, nothing to remind him of
+                entry["followed_up"] = True  # no SPeCTRUM attendance, nothing to check in for
+                if notes and notes[0].startswith("Announcement"):
+                    messages.append(message(heading(b, where), notes))
             elif PRESENT.search(status):
-                messages.append(f"{heading(b)} SPeCTRUM already shows you {status}.")
+                messages.append(message(f"{heading(b, where)} SPeCTRUM already shows you {status}.", notes))
                 entry["followed_up"] = True
             elif status:
-                messages.append(f"{heading(b)} SPeCTRUM shows you {status} for this class. If you're there, tell the "
-                                f"lecturer.")
+                messages.append(message(f"{heading(b, where)} SPeCTRUM shows you {status} for this class. If you're "
+                                        f"there, tell the lecturer.", notes))
                 entry["followed_up"] = True
             else:
-                messages.append(f"{heading(b)} Reply \"here\" and I'll check you in on SPeCTRUM.")
+                messages.append(message(f"{heading(b, where)} Reply \"here\" and I'll check you in on SPeCTRUM.",
+                                        notes))
             continue
         if entry.get("followed_up") or now < b.start + FOLLOW_UP:
             continue

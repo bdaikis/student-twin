@@ -8,6 +8,8 @@ import html
 import json
 import os
 import re
+import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -199,6 +201,143 @@ def is_announcement_forum(forum: dict) -> bool:
 def post_text(message: str) -> str:
     """A forum post's HTML as one line of plain text."""
     return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", message or "")).split())
+
+
+def announcement_posts(courses: dict[int, str], days: int = 14) -> list[tuple[int, str, str, dict]]:
+    """(posted, course code, forum name, discussion) for the posts of the last `days` days in the
+    announcement forums of `courses` ({portal course id: code}), newest first. Raises MoodleError."""
+    if not courses:
+        return []
+    m = moodle()
+    since = int(time.time()) - max(days, 1) * 86400
+    forums = [f for f in m.call("mod_forum_get_forums_by_courses",
+                                **{f"courseids[{i}]": c for i, c in enumerate(courses)})
+              if is_announcement_forum(f)]
+    posts = []
+    for f in forums:
+        for d in m.call("mod_forum_get_forum_discussions", forumid=f["id"], sortorder=1,
+                        perpage=10).get("discussions", []):
+            at = d.get("created") or d.get("timemodified") or 0
+            if at >= since:
+                posts.append((at, courses.get(f["course"], "?"), f["name"], d))
+    return sorted(posts, key=lambda p: -p[0])
+
+
+# --- Which day a post is about ------------------------------------------------------------------
+# Lecturers post class changes in English and Malay: "Tuesday, 10/11/2026 is an online class ya",
+# "Tomorrow's class shall be conducted online", "This week will be a face-to-face class".
+RELATIVE_DAYS = (("today", 0), ("tonight", 0), ("tomorrow", 1), ("hari ini", 0), ("malam ini", 0),
+                 ("esok", 1), ("besok", 1))
+_MONTHS = ("jan|january|januari", "feb|february|februari", "mar|march|mac", "apr|april", "may|mei",
+           "jun|june", "jul|july|julai", "aug|august|ogos", "sep|sept|september", "oct|october|oktober",
+           "nov|november", "dec|december|disember")
+_MONTH = "|".join(_MONTHS)
+_WEEKDAYS = ("mon|monday|isnin", "tue|tues|tuesday|selasa", "wed|wednesday|rabu",
+             "thu|thur|thurs|thursday|khamis", "fri|friday|jumaat", "saturday|sabtu", "sunday|ahad")
+_ONLINE = re.compile(r"(?i)\bonline\b|google meet|meet\.google|\bzoom\b|voov|microsoft teams|teams\.microsoft|"
+                     r"webex|dalam talian|atas talian")
+_IN_PERSON = re.compile(r"(?i)face[- ]to[- ]face|physical (?:class|lecture)|in[- ]person|offline|bersemuka|"
+                        r"kelas fizikal")
+_ABOUT_CLASS = re.compile(r"(?i)\b(class|classes|lecture|tutorial|kelas|kuliah|venue|room|dewan|bilik)\b"
+                          r"|online|cancel|postpone|batal|tangguh")
+_MEETING = re.compile(r"(?i)(?:https?://)?(?:meet\.google\.com|[\w.-]*zoom\.us|voovmeeting\.com|"
+                      r"teams\.microsoft\.com|teams\.live\.com|[\w.-]*webex\.com)/[^\s<>\"')]+")
+
+
+def _month(word: str) -> int:
+    return next(i + 1 for i, names in enumerate(_MONTHS) if re.fullmatch(names, word, re.I))
+
+
+def dates_in(text: str, posted: date) -> set[date]:
+    """Calendar dates written in a post: 10/11, 10/11/2026, 2026/11/06, 6 Nov, 5th November,
+    November 5. Day before month, as in Malaysia. A missing year is the post's own, or the next
+    one for a date more than two months before the post. Times ("3.30pm", "10-11am") are not dates,
+    and a bare "3/4" counts only if it falls within two weeks before to two months after the post
+    (a maths post may write fractions)."""
+    found = set()
+
+    def add(year, month, day, near):
+        try:
+            when = date(int(year) if year else posted.year, int(month), int(day))
+            if not year and (posted - when).days > 60:
+                when = when.replace(year=when.year + 1)
+        except ValueError:  # 31/2, or 29 Feb in the following year
+            return
+        if near and not -14 <= (when - posted).days <= 60:
+            return
+        found.add(when)
+
+    def take(pattern, order, near=False):
+        nonlocal text
+        for m in re.finditer(pattern, text, re.I):
+            y, mo, d = (m[i] if i else None for i in order)
+            if y and len(y) == 2:
+                y = "20" + y
+            add(y, mo if mo.isdigit() else _month(mo), d, near)
+        text = re.sub(pattern, " ", text, flags=re.I)
+
+    take(r"(?<!\d)(20\d\d)[/.-](\d{1,2})[/.-](\d{1,2})(?!\d)", (1, 2, 3))
+    take(r"(?<!\d)(\d{1,2})[/.-](\d{1,2})[/.-](20\d\d|\d\d)(?!\d)", (3, 2, 1))
+    take(r"(?<![\d/])(\d{1,2})/(\d{1,2})(?![\d/])(?!\s*[ap]\.?m)", (0, 2, 1), near=True)
+    take(rf"(?<![\d/])(\d{{1,2}})(?:st|nd|rd|th|hb)?\s+(?:of\s+)?({_MONTH})\b(?:\s+(20\d\d))?", (3, 2, 1))
+    take(rf"\b({_MONTH})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?!\d)(?:,?\s+(20\d\d))?", (3, 1, 2))
+    return found
+
+
+def post_about_day(text: str, posted: datetime, day: date) -> bool:
+    """Whether a post (subject and text) is about `day`. A post that writes a date is about the
+    dates it writes. Otherwise: "today"/"tomorrow" counted from the post's own date, then a weekday
+    named within the week after the post, then "this week"/"next week", and last, a post from that
+    same day that talks about a class (online, cancelled, a room)."""
+    p = posted.date()
+    gap = (day - p).days
+    if gap < 0:
+        return False
+    written = dates_in(text, p)
+    if written:
+        return day in written
+    relative = [n for w, n in RELATIVE_DAYS if re.search(rf"(?i)\b{w}\b", text)]
+    if relative:
+        return gap in relative
+    if re.search(rf"(?i)\b(?:{'|'.join(_WEEKDAYS)})\b", text):  # names a weekday: that one only
+        return gap <= 7 and bool(re.search(rf"(?i)\b(?:{_WEEKDAYS[day.weekday()]})\b", text))
+    if re.search(r"(?i)\bthis week\b|minggu ini", text) and p.isocalendar()[:2] == day.isocalendar()[:2]:
+        return True
+    if re.search(r"(?i)\bnext week\b|minggu depan", text) and \
+            (p + timedelta(days=7)).isocalendar()[:2] == day.isocalendar()[:2]:
+        return True
+    return gap == 0 and bool(_ABOUT_CLASS.search(text))
+
+
+def class_announcements(block, posts: list[tuple[int, str, str, dict]]) -> tuple[str, list[str]]:
+    """Where a timetable class (`timetable.ClassBlock`) is, and lines on the announcements about
+    its day from `posts` (announcement_posts). The newest post that says online or in person (not
+    both, as a poll does) decides where the class is (SIF1017's lecturer moved Tue 10 Nov online by
+    announcement; the timetable kept DKFIZIK) and is quoted in full; up to two others by title."""
+    where = "online" if block.online else block.location
+    about = []
+    for at, code, _forum, d in posts:
+        posted = datetime.fromtimestamp(at, block.start.tzinfo)
+        subject, text = d.get("subject", "").strip(), post_text(d.get("message", ""))
+        if code == block.code and post_about_day(f"{subject} {text}", posted, block.start.date()):
+            about.append((posted, d.get("userfullname", "").strip(" .") or "the lecturer", subject, text))
+    if not about:
+        return where, []
+    modes = [(a, bool(_ONLINE.search(f"{a[2]} {a[3]}"))) for a in about
+             if bool(_ONLINE.search(f"{a[2]} {a[3]}")) != bool(_IN_PERSON.search(f"{a[2]} {a[3]}"))]
+    main = modes[0][0] if modes else about[0]
+    if modes and modes[0][1] and not block.online:
+        where = f"online, per the announcement below (the timetable says {block.location})"
+    elif modes and not modes[0][1] and block.online:
+        where = "in person, per the announcement below (the timetable says online)"
+    posted, author, subject, text = main
+    shown = text[:280] + ("…" if len(text) > 280 else "")
+    links = [u for u in dict.fromkeys(_MEETING.findall(text)) if u not in shown]
+    lines = [f"Announcement, {posted:%a %d %b %H:%M}, {author}: {subject}"
+             + (f"{'' if subject[-1:] in '.!?' else '.'} {shown}" if shown else "")
+             + (f" Link: {' '.join(links)}" if links else "")]
+    lines += [f"Also: {p:%a %d %b %H:%M}, {s}" for p, _, s, _ in [a for a in about if a is not main][:2]]
+    return where, lines
 
 
 def course_id(info: dict) -> int | None:

@@ -3,7 +3,10 @@ call; whatever this prints is sent to Bhanu on Telegram.
 
     hermes cron create "0 7,21 * * *" --no-agent --script digest.py --deliver telegram --name digest
 
-Morning: today's classes. Evening: tomorrow's. Both: what's due in the next 7 days, nothing whose
+Morning: today's classes. Evening: tomorrow's. Each class with the course's announcements about
+that day, and "online" when the newest says so (SIF1017's Tue 10 Nov class was moved online by an
+announcement at 17:36 the day before; the 21:00 digest still said DKFIZIK). Both: what's due in
+the next 7 days, nothing whose
 date has passed (SPeCTRUM read first), and what changed since the last digest. Sent every day,
 so a missing digest means something broke. After the laptop has slept through a slot, a digest is
 still sent if it is less than three hours late; each slot is sent once.
@@ -17,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mcp_servers"))
 
 import deadlines as dl  # noqa: E402
 import timetable  # noqa: E402
+from common import announcement_posts, class_announcements  # noqa: E402
 
 SLOTS = {"morning": 7, "evening": 21}
 LATE_LIMIT = timedelta(hours=3)
@@ -63,10 +67,23 @@ def compose(now: datetime, slot: str, since: int, refresh_note: str = "") -> str
     lines = [f"{label}, {day:%a %d %b}" + (f", {week}" if week else "") + ":"]
     try:
         classes = timetable.on_day(day)
-        lines += [f"- {b.start:%H:%M}–{b.end:%H:%M} {b.code} {b.name.title()} {b.activity.lower()}, "
-                  f"{'online' if b.online else b.location}" for b in classes] or ["- No classes."]
     except RuntimeError as exc:
+        classes = []
         lines.append(f"- Timetable unavailable: {exc}")
+    else:
+        try:
+            codes = {b.code for b in classes}
+            posts, unread = announcement_posts({c: k for c, k in dl._courses().items() if k in codes}), ""
+        except Exception as exc:
+            posts, unread = [], f"- (Couldn't read the course announcements: {exc})"
+        for b in classes:
+            where, notes = class_announcements(b, posts)
+            lines.append(f"- {b.start:%H:%M}–{b.end:%H:%M} {b.code} {b.name.title()} {b.activity.lower()}, {where}")
+            lines += [f"  {n}" for n in notes]
+        if not classes:
+            lines.append("- No classes.")
+        elif unread:
+            lines.append(unread)
     ts = int(now.timestamp())
     rows = dl.upcoming(7)
     soon = [r for r in rows if r["due"] >= ts]

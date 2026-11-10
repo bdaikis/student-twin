@@ -20,8 +20,8 @@ from mcp.server.mcpserver import MCPServer
 import course_files
 import deadlines as dl
 import timetable
-from common import (DATA, PRESENT, course_contents, course_id, is_announcement_forum, match_course, moodle,
-                    post_text, remember_sessions, remembered_session, session_for, totals_verdict)
+from common import (DATA, PRESENT, RELATIVE_DAYS, announcement_posts, course_contents, course_id, match_course,
+                    moodle, post_text, remember_sessions, remembered_session, session_for, totals_verdict)
 
 server = MCPServer(
     "portal",
@@ -180,10 +180,6 @@ def course_materials(course: str) -> str:
     return "\n".join(lines)
 
 
-# Lecturers write "tomorrow's class is online": the day that means, counted from the post's date.
-RELATIVE_DAYS = (("today", 0), ("tonight", 0), ("tomorrow", 1), ("hari ini", 0), ("esok", 1))
-
-
 @server.tool()
 def announcements(course: str = "", days: int = 14) -> str:
     """Posts in Bhanu's course announcement forums on SPeCTRUM from the last `days` days (default 14),
@@ -201,26 +197,15 @@ def announcements(course: str = "", days: int = 14) -> str:
         courses = {cid: code for cid, code in courses.items() if code == got[0]}
     if not courses:
         return "No course pages are set up in the twin's config."
-    m = moodle()
-    since = int(time.time()) - max(days, 1) * 86400
     try:
-        forums = [f for f in m.call("mod_forum_get_forums_by_courses",
-                                    **{f"courseids[{i}]": c for i, c in enumerate(courses)})
-                  if is_announcement_forum(f)]
-        posts = []
-        for f in forums:
-            for d in m.call("mod_forum_get_forum_discussions", forumid=f["id"], sortorder=1,
-                            perpage=10).get("discussions", []):
-                at = d.get("created") or d.get("timemodified") or 0
-                if at >= since:
-                    posts.append((at, courses.get(f["course"], "?"), f["name"], d))
+        posts = announcement_posts(courses, days)
     except MoodleError as exc:
         return f"Couldn't read SPeCTRUM's forums just now: {exc}"
     where = f" in {next(iter(courses.values()))}" if course else ""
     if not posts:
         return f"No announcements{where} in the last {days} days."
     lines = [f"Announcements{where}, last {days} days, newest first:"]
-    for at, code, forum, d in sorted(posts, key=lambda p: -p[0]):
+    for at, code, forum, d in posts:
         text = post_text(d.get("message", ""))
         files = [a.get("filename") for a in d.get("attachments") or [] if a.get("filename")]
         subject = d.get("subject", "").strip()
@@ -373,6 +358,17 @@ _MESSAGES = {
 }
 
 
+def _has_attendance(code: str) -> bool:
+    """Whether the course has a SPeCTRUM attendance activity with sessions (True if unknown)."""
+    match = match_course(code)
+    if isinstance(match, str):
+        return False
+    try:
+        return bool(_activities(code, course_id(match[1])))
+    except Exception:
+        return True
+
+
 def _log(entry: dict) -> None:
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with LOG.open("a", encoding="utf-8") as f:
@@ -383,11 +379,12 @@ def _log(entry: dict) -> None:
 def mark_attendance(course: str = "") -> str:
     """Check Bhanu in on SPeCTRUM for the class he is in right now. Call it only when he says he is
     in class ("here", "I'm here", "check me in"), usually in reply to a class reminder; never on your
-    own initiative. `course` may be empty: the class running now in his timetable is used, but pass
-    the code when the class is known (empty once picked SIF1003, which has no SPeCTRUM attendance,
-    over the class he was in). Works only while that class runs (from 10 minutes before the start
-    until the end). Labs are marked in person. Don't remind him to sign the paper sheet: he asked
-    not to be."""
+    own initiative. Pass the course of the reminder he is replying to: it appears in the conversation
+    as "[Cron delivery: class-reminders]" and starts with the course code. Not a course from earlier
+    talk: on 10 Nov a "here" for SIF1014 was sent as SIF1017, the course discussed the night before.
+    Empty uses the class running now in his timetable, preferring one with SPeCTRUM attendance.
+    Works only while that class runs (from 10 minutes before the start until the end). Labs are
+    marked in person. Don't remind him to sign the paper sheet: he asked not to be."""
     from moodle import MoodleError
     try:
         running = timetable.in_progress()
@@ -397,7 +394,16 @@ def mark_attendance(course: str = "") -> str:
         want = match_course(course)
         if isinstance(want, str):
             return want
-        running = [b for b in running if b.code == want[0]]
+        named = [b for b in running if b.code == want[0]]
+        others = [b for b in running if b.code != want[0] and b.activity != "LAB"]
+        if not named and others:
+            return (f"Not checked in: {want[0]} isn't running now. Running now: {others[0].line()}. If his "
+                    f"\"here\" is about that class (see the last class reminder in the conversation), call "
+                    f"mark_attendance again with course \"{others[0].code}\".")
+        running = named
+    elif len(running) > 1:
+        # At 08:55 SIF1003 (08:00-09:00, no SPeCTRUM attendance) still runs while SIF1014 opens.
+        running.sort(key=lambda b: (b.activity == "LAB", not _has_attendance(b.code)))
     if not running:
         try:
             upcoming = [b for b in timetable.classes() if b.start > timetable.now()][:1]

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'">
+  <title>Pointer</title>
+  <!-- The ring point_at shows (2026-11-11): click-through and content-protected. The ring's centre
+       is 60 px in from the box's near edge and halfway down; main.js places it on the spot. -->
+  <style>
+    html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+    /* The window's size in main.js (POINTER_W x POINTER_H), fixed here so the ring stays on the spot
+       even if Windows makes the window a few pixels larger */
+    #p { position: absolute; left: 0; top: 0; width: 380px; height: 120px; visibility: hidden; }
+    #p.on { visibility: visible; }
+    .ring {
+      position: absolute; left: 60px; top: 50%; width: 40px; height: 40px; margin: -20px 0 0 -20px;
+      box-sizing: border-box; border-radius: 50%; border: 3px solid #fff;
+      /* a dark edge and a blue glow, so it reads on light and dark pages alike */
+      box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55), 0 0 14px 4px rgba(70, 150, 255, 0.85), inset 0 0 0 2px rgba(0, 0, 0, 0.35);
+    }
+    .dot {
+      position: absolute; left: 60px; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px;
+      border-radius: 50%; background: #fff; box-shadow: 0 0 0 1.5px rgba(0, 0, 0, 0.6);
+    }
+    .label {
+      position: absolute; left: 96px; top: 50%; transform: translateY(-50%); max-width: 260px;
+      padding: 5px 11px; border-radius: 12px; background: rgba(22, 22, 26, 0.92); color: #fff;
+      font: 600 13px/1.25 "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+    }
+    #p.flip .ring, #p.flip .dot { left: auto; right: 60px; margin-left: 0; }
+    #p.flip .ring { margin-right: -20px; }
+    #p.flip .dot { margin-right: -3px; }
+    #p.flip .label { left: auto; right: 96px; }
+    /* In from three times its size, then a slow pulse while it stays */
+    #p.on .ring { animation: land 0.35s ease-out, pulse 1.3s ease-in-out 0.35s infinite; }
+    #p.on .label, #p.on .dot { animation: fade 0.35s ease-out; }
+    @keyframes land { from { transform: scale(3); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+    @keyframes pulse { 50% { transform: scale(1.18); } }
+    @keyframes fade { from { opacity: 0; } }
+  </style>
+</head>
+<body>
+  <div id="p"><div class="ring"></div><div class="dot"></div><div class="label"></div></div>
+  <script src="pointer.js"></script>
+</body>
+</html>

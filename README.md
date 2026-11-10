@@ -153,6 +153,16 @@ still part of the desktop host plan.
 After updating from an earlier version, restart Hermes so it reloads the desktop server and
 restart the widget for its new screenshot guidance. Send `/new` on Telegram so both channels see the new tool.
 
+### Ask about the window you're in, and see where to click
+
+Each widget request carries the title of the window you were using when you asked, so "what does
+this mean?" or "where's the export button here?" needs no window name. A messaging or email
+window's title is left out. When you ask where something is or what to click, the twin looks at
+that window and rings the spot on your screen for a few seconds, with a short label, and says what
+to click. The ring never clicks anything, and clicks pass straight through it. It goes when you
+click or scroll, switch to another window, move the window, ask again, or after 12 seconds. Only
+requests from the widget show it, not Telegram. Restart Hermes and the widget after updating.
+
 ### Moving to another computer
 
 `scripts\transfer_state.py export <folder>` copies the twin's settings (shared rules, memory, the

@@ -10,7 +10,8 @@ window's labelled elements through UI Automation (ui_read, ui_click, ui_type), w
 messaging windows and elements that look irreversible. Irreversible tools (step 2d-ii:
 delete_files) act only after Bhanu clicks Confirm on the widget's confirm card; see confirm.py.
 Screen control (screen_look, screen_click, screen_type, screen_scroll) is the last resort, for what
-the accessibility tree can't reach, and refuses the same windows and elements.
+the accessibility tree can't reach, and refuses the same windows and elements. point_at shows Bhanu
+a spot from a screen_look image, drawn by the widget, without clicking anything.
 
 Course contents come from the portal's Moodle API through moodle.py (read-only allowlist).
 Per-user settings (course pages, browser profiles, default music, home city) come from
@@ -36,6 +37,8 @@ from mcp.server.mcpserver import Context, MCPServer
 
 from common import CONFIG_PATH, config as _config, course_contents as _course_contents, expand_path as _expand_path
 from common import match_course as _match_course, norm as _norm
+from common import DATA as _DATA
+from messaging import MESSAGING as _MESSAGING  # shared with the widget's voice helper
 
 
 server = MCPServer(
@@ -954,7 +957,6 @@ def write_text_file(folder: str, name: str, text: str) -> str:
 # refuses messaging windows and elements whose names suggest one; deleting goes through
 # delete_files and its confirm card.
 
-_MESSAGING = re.compile(r"(?i)whatsapp|gmail|outlook|telegram|messenger|discord|slack|signal|teams|\bmail\b|inbox")
 _IRREVERSIBLE = re.compile(r"(?i)\b(delete|remove|erase|uninstall|submit|send|pay|purchase|buy|checkout|"
                            r"place order|transfer|unenrol|unenroll|format|reset|discard|empty)\b")
 _UI_KINDS = {"ButtonControl": "button", "HyperlinkControl": "link", "MenuItemControl": "menu item",
@@ -1569,6 +1571,42 @@ async def pick_files(folder: str, pattern: str = "*", recursive: bool = False, n
                     "the box closed, so the site has them. Its page shows any upload progress or rejected types.")
     return (f"The Open box of {d['owner']!r} is still open after choosing the files; it may be showing an "
             "error (a file type the site doesn't accept, or a single-file box). Look at it with screen_look.")
+
+
+# --- Pointing (2026-11-11): show Bhanu where something is, as Clicky's cursor does ----------------
+# The widget draws a ring at the spot for a few seconds (its pointer window); this tool only checks
+# the spot and hands it over in <data>/pointer.json, in physical screen pixels. The widget clears the
+# ring on a click, the wheel, another window coming to the front, or the window moving.
+POINTER_FILE = _DATA / "pointer.json"
+
+
+@server.tool()
+def point_at(window: str, x: float, y: float, label: str) -> str:
+    """Show Bhanu where something is on his screen: the widget rings (x, y) of the window's last
+    screen_look image for a few seconds, with `label` (two to four words, e.g. "Insert menu") beside
+    it. Use it when he asks where something is, what to click, or how to do something in a window,
+    after looking at it; still say in a sentence what to click. One point per answer, and only for a
+    request from the widget (he is at the computer), never for Telegram."""
+    import confirm
+    if not confirm.widget_busy():
+        return "Not shown: the pointer only appears for a request from the widget, at the computer. Describe the spot in words."
+    win, err = _ui_window(window)
+    if err:
+        return err
+    point, err = _screen_point(win, x, y)
+    if err:
+        return err
+    sx, sy = point
+    under = user32.GetAncestor(user32.WindowFromPoint(POINT(sx, sy)), 2)  # GA_ROOT
+    if under != win["hwnd"]:
+        return f"Another window covers that point ({_window_title(under)!r}); bring {win['title']!r} forward and look again."
+    label = " ".join(str(label).split())[:40] or "here"
+    POINTER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = POINTER_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"x": sx, "y": sy, "label": label, "hwnd": win["hwnd"], "at": time.time()}),
+                   encoding="utf-8")
+    os.replace(tmp, POINTER_FILE)
+    return f"Pointing at {label!r} in {win['title']!r} for a few seconds."
 
 
 @server.tool()

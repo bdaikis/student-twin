@@ -10,8 +10,12 @@ Protocol: JSON lines. Commands on stdin, events on stdout.
             {"event": "snip", "phase": "arm"|"cancel"|"release"}   (the Ctrl gesture, below)
             {"event": "snip_ready", "source": "snipping"}   (a Win+Shift+S image reached the clipboard)
             {"event": "grabbed", "id", "ok": true, "width", "height"} | {"event": "grabbed", "id", "ok": false, "error"}
+            {"event": "foreground", "id", "title", "process", "messaging", "desktop"}
+            {"event": "pointer_clear", "reason": "input"|"focus"|"moved"|"closed"}
             {"event": "log", "message"}
   commands: {"cmd": "transcribe", "id": "...", "path": "C:/...wav"} | {"cmd": "restore_focus"}
+            {"cmd": "foreground", "id": "..."}   (the window in front, for the widget's request rules)
+            {"cmd": "pointer", "hwnd": 123 | null}   (a pointer is shown on that window, or gone)
             {"cmd": "configure", "talk": {...}, "hold_ms": 300, "snip": true}
             {"cmd": "capture", "cancel"?: true}
             {"cmd": "grab", "id": "...", "points": [[x, y], ...]} or "rect": [left, top, right, bottom]
@@ -42,15 +46,23 @@ shape and turns the rest white. Nothing is swallowed: Ctrl and everything presse
 reach the app as usual. It never arms while a full-screen app is in front or the pointer is
 hidden (games hold Ctrl to crouch or sprint while turning). Win+Shift+S is watched too: the next
 clipboard change within 90 s that holds an image is reported as "snip_ready".
+
+The window in front (2026-11-11): "foreground" reports the last window Bhanu used that isn't the
+widget, so a question about "this" can go straight to that window. A messaging window's title is
+left out (mcp_servers/messaging.py). While the widget shows a pointer (desktop.py's point_at),
+"pointer_clear" says it has gone stale: a click or the wheel, another window to the front, or the
+pointed window moving, resizing, minimizing or closing.
 """
 import ctypes
 import ctypes.wintypes as wt
+import importlib.util
 import json
 import os
 import queue
 import sys
 import threading
 import time
+from pathlib import Path
 
 NUMPAD_DOT = {"device": "key", "scan": 0x53, "extended": False}
 CAPTURE_TIMEOUT_S = 15
@@ -491,7 +503,7 @@ _hook_jobs = queue.Queue()  # mouse-hook installs and removals, kept off the hoo
 
 
 def mouse_wanted():
-    return ptt.wants_mouse() or snip.state == SnipGesture.ARMED
+    return ptt.wants_mouse() or snip.state == SnipGesture.ARMED or pointer.active()
 
 
 def run_hook_jobs():
@@ -643,6 +655,8 @@ class MouseHook:
         def proc(n_code, w_param, l_param):
             if n_code == 0 and w_param in SNIP_CANCELS:
                 snip.mouse()  # Ctrl+click or Ctrl+scroll: not a snip; the event goes on as usual
+                if pointer.hwnd is not None:
+                    pointer.touched.set()  # the shown pointer goes; its watcher reports it, not this hook
             if n_code == 0 and (w_param == WM_XBUTTONDOWN or w_param == WM_XBUTTONUP):
                 ms = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                 try:
@@ -734,6 +748,149 @@ def restore_focus():
     user32.SetForegroundWindow(hwnd)
 
 
+# --- The window in front, for widget requests (2026-11-11) -------------------------------------
+# The widget adds its title to each request, so "what does this mean?" can go straight to
+# screen_look on it. Messaging windows are recognised by the same rule desktop.py refuses them with.
+def _load_messaging():
+    spec = importlib.util.spec_from_file_location(
+        "student_twin_messaging", Path(__file__).resolve().parents[2] / "mcp_servers" / "messaging.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.is_messaging
+
+
+is_messaging = _load_messaging()
+DESKTOP_CLASSES = {"Progman", "WorkerW"}
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+
+
+def _title(hwnd):
+    n = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(n + 1)
+    user32.GetWindowTextW(hwnd, buf, n + 1)
+    return buf.value
+
+
+def _process(hwnd):
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not h:
+        return ""
+    try:
+        buf, size = ctypes.create_unicode_buffer(260), wt.DWORD(260)
+        return os.path.basename(buf.value) if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)) else ""
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def foreground_info(hwnd=None):
+    """The last window Bhanu used that isn't the widget: {"title", "process", "messaging",
+    "desktop"}, with no title for a messaging window; {} when there is none."""
+    hwnd = hwnd or _last_other
+    if not hwnd or not user32.IsWindow(hwnd):
+        return {}
+    cls = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, cls, 64)
+    if cls.value in DESKTOP_CLASSES:
+        return {"title": "", "process": "explorer.exe", "messaging": False, "desktop": True}
+    title, process = " ".join(_title(hwnd).split()), _process(hwnd)
+    messaging = is_messaging(title, process)
+    return {"title": "" if messaging else title[:200], "process": process, "messaging": messaging, "desktop": False}
+
+
+# --- A pointer the widget shows (desktop.py's point_at, 2026-11-11) ----------------------------
+RECT = wt.RECT
+user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
+user32.IsIconic.argtypes = [wt.HWND]
+
+
+def _rect(hwnd):
+    r = RECT()
+    return (r.left, r.top, r.right, r.bottom) if user32.GetWindowRect(hwnd, ctypes.byref(r)) else None
+
+
+def _counts_as_front(hwnd):
+    """Whether a foreground change to hwnd is Bhanu moving on: not the widget, not the taskbar
+    (which takes the foreground for a moment when focus changes hands)."""
+    if not hwnd:
+        return False
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    cls = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, cls, 64)
+    return pid.value != WIDGET_PID and cls.value not in TASKBAR_CLASSES
+
+
+class Pointer:
+    """Watches the window a pointer is shown on, every POLL_S, and reports once when the pointer
+    should go. The mouse hook only sets `touched` (a click or the wheel); it never waits here."""
+    POLL_S = 0.1
+
+    def __init__(self):
+        self.hwnd = None
+        self.rect = None
+        self.front = None  # the foreground window when the pointer appeared
+        self.lock = threading.Lock()
+        self.touched = threading.Event()
+        self.wake = threading.Event()
+
+    def active(self):
+        return self.hwnd is not None
+
+    def show(self, hwnd):
+        with self.lock:
+            self.touched.clear()
+            self.hwnd = hwnd if hwnd and user32.IsWindow(hwnd) else None
+            self.rect = _rect(hwnd) if self.hwnd else None
+            self.front = user32.GetForegroundWindow()
+        _hook_jobs.put(None)  # the mouse hook is wanted while a pointer is shown
+        self.wake.set()
+
+    def stale(self):
+        """Why the shown pointer should go, or None."""
+        hwnd = self.hwnd
+        if hwnd is None:
+            return None
+        if self.touched.is_set():
+            return "input"
+        if not user32.IsWindow(hwnd):
+            return "closed"
+        if user32.IsIconic(hwnd) or _rect(hwnd) != self.rect:
+            return "moved"
+        fg = user32.GetForegroundWindow()
+        if fg not in (self.front, hwnd) and _counts_as_front(fg):
+            return "focus"
+        return None
+
+    def check(self):
+        with self.lock:
+            reason = self.stale()
+            if reason:
+                self.hwnd = None
+                emit(event="pointer_clear", reason=reason)
+        if reason:
+            _hook_jobs.put(None)
+        return reason
+
+    def watch(self):
+        while True:
+            self.wake.wait()
+            self.wake.clear()
+            while self.hwnd is not None:
+                time.sleep(self.POLL_S)
+                self.check()
+
+
+pointer = Pointer()
+
+
 # --- Full-screen detection, so the widget's top-edge reveal stays out of games and videos --------
 # Windows sends no event when a full-screen app starts, so ask once a second and report changes.
 # QUNS_BUSY (2), QUNS_RUNNING_D3D_FULL_SCREEN (3), QUNS_PRESENTATION_MODE (4), QUNS_APP (7: a Store
@@ -804,6 +961,16 @@ def run_commands():
             _jobs.put(cmd)  # transcribed in order on its own thread, so focus commands never wait
         elif cmd.get("cmd") == "restore_focus":
             restore_focus()
+        elif cmd.get("cmd") == "foreground":
+            try:
+                info = foreground_info()
+            except Exception as exc:
+                info = {}
+                emit(event="log", message=f"foreground failed: {type(exc).__name__}")
+            emit(event="foreground", id=cmd.get("id"), **info)
+        elif cmd.get("cmd") == "pointer":
+            hwnd = cmd.get("hwnd")
+            pointer.show(hwnd if isinstance(hwnd, int) else None)
         elif cmd.get("cmd") == "configure":
             ptt.configure(cmd.get("talk"), cmd.get("hold_ms"))
             if "snip" in cmd:
@@ -866,6 +1033,7 @@ def main():
     threading.Thread(target=snip.watchdog, daemon=True).start()
     threading.Thread(target=snip.clipboard_watch, daemon=True).start()
     threading.Thread(target=run_focus_tracker, daemon=True).start()
+    threading.Thread(target=pointer.watch, daemon=True).start()
     threading.Thread(target=run_fullscreen_watch, daemon=True).start()
     # Commands are read from the start, so a settings change or a capture needn't wait for the model.
     threading.Thread(target=run_commands, daemon=True).start()

@@ -176,11 +176,52 @@ def send_keys(*inputs):
     user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
 
 
+# Taps the hooks held back are re-sent from their own thread, never from inside a hook. SendInput
+# waits for every low-level hook to see the input, this helper's own included. On 10 Nov 2026 a
+# back-button tap was re-sent from the mouse hook under the push-to-talk lock; a back-button press
+# that arrived while SendInput waited needed that lock, and the hook thread waited on itself. Push
+# to talk, the keyboard hook, the settings capture and every other program's injected input stayed
+# stuck until the helper was restarted.
+_resends = queue.Queue()
+
+
+def resend(*inputs):
+    _resends.put(inputs)
+
+
+def run_resends(jobs=_resends):
+    while True:
+        try:
+            send_keys(*jobs.get())
+        except Exception as exc:
+            emit(event="log", message=f"re-send failed: {type(exc).__name__}")
+
+
 def modifier_down():
     return any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in (VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN))
 
 
 # --- Tap-hold state machine -------------------------------------------------------------------
+class HookLock:
+    """A lock as taken inside a hook callback: given up after HOOK_LOCK_S, when the event passes
+    through untouched, rather than wait and hold up all input on the desktop."""
+    HOOK_LOCK_S = 0.2
+
+    def __init__(self, lock):
+        self.lock = lock
+        self.held = False
+
+    def __enter__(self):
+        self.held = self.lock.acquire(timeout=self.HOOK_LOCK_S)
+        if not self.held:
+            emit(event="log", message="push-to-talk busy: an input event passed through")
+        return self.held
+
+    def __exit__(self, *exc):
+        if self.held:
+            self.lock.release()
+
+
 class PushToTalk:
     IDLE, PENDING, HOLDING, PASSTHROUGH = range(4)
 
@@ -261,7 +302,7 @@ class PushToTalk:
         state, self.state = self.state, self.IDLE
         if state == self.PENDING:
             self.timer.cancel()
-            send_keys(*resend_tap)
+            resend(*resend_tap)
             emit(event="tap")
             return True
         if state == self.HOLDING:
@@ -275,7 +316,9 @@ class PushToTalk:
             return False  # our own re-sent keys (and other software's) pass through
         ext = bool(kb.flags & LLKHF_EXTENDED)
         down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
-        with self.lock:
+        with HookLock(self.lock) as held:
+            if not held:
+                return False
             if self.capturing and down:
                 if kb.vkCode == VK_ESCAPE:
                     return self._captured(None, ("key", kb.scanCode, ext))
@@ -296,8 +339,8 @@ class PushToTalk:
             if down and self.state == self.PENDING:
                 self.timer.cancel()
                 self.state = self.PASSTHROUGH
-                send_keys(_key(self.vk, scan, extended=t_ext), _key(self.vk, scan, up=True, extended=t_ext),
-                          _key(kb.vkCode, kb.scanCode, extended=ext))
+                resend(_key(self.vk, scan, extended=t_ext), _key(self.vk, scan, up=True, extended=t_ext),
+                       _key(kb.vkCode, kb.scanCode, extended=ext))
                 emit(event="tap")
                 return True
         return False
@@ -310,7 +353,9 @@ class PushToTalk:
             return False
         button = (ms.mouseData >> 16) & 0xFFFF
         down = msg == WM_XBUTTONDOWN
-        with self.lock:
+        with HookLock(self.lock) as held:
+            if not held:
+                return False
             if self.capturing and down and button in SIDE_BUTTONS:
                 return self._captured({"device": "mouse", "button": button}, ("mouse", button))
             if self.swallow_up == ("mouse", button):
@@ -813,6 +858,7 @@ def main():
         start = {}
     ptt.configure(start.get("talk"), start.get("hold_ms"))
     snip.enabled = start.get("snip", True) is not False
+    threading.Thread(target=run_resends, daemon=True).start()
     if HOOKS:
         threading.Thread(target=run_hook, daemon=True).start()
         mouse_hook.sync(mouse_wanted())

@@ -10,13 +10,16 @@ Protocol: JSON lines. Commands on stdin, events on stdout.
             {"event": "snip", "phase": "arm"|"cancel"|"release"}   (the Ctrl gesture, below)
             {"event": "snip_ready", "source": "snipping"}   (a Win+Shift+S image reached the clipboard)
             {"event": "grabbed", "id", "ok": true, "width", "height"} | {"event": "grabbed", "id", "ok": false, "error"}
-            {"event": "foreground", "id", "title", "process", "messaging", "desktop"}
+            {"event": "foreground", "id", "title", "process", "messaging", "desktop", "selection"}
+            {"event": "selection", "id", "chars"}   (the highlighted text has been read, or not)
             {"event": "pointer_clear", "reason": "input"|"focus"|"moved"|"closed"}
             {"event": "log", "message"}
   commands: {"cmd": "transcribe", "id": "...", "path": "C:/...wav"} | {"cmd": "restore_focus"}
             {"cmd": "foreground", "id": "..."}   (the window in front, for the widget's request rules)
+            {"cmd": "selection", "id": "..."}   (read the highlighted text now: the typing card opens)
+            {"cmd": "release_keys", "replay": true|false}   (the widget has the keyboard, or won't)
             {"cmd": "pointer", "hwnd": 123 | null}   (a pointer is shown on that window, or gone)
-            {"cmd": "configure", "talk": {...}, "hold_ms": 300, "snip": true}
+            {"cmd": "configure", "talk": {...}, "hold_ms": 300, "snip": true, "selection": true}
             {"cmd": "capture", "cancel"?: true}
             {"cmd": "grab", "id": "...", "points": [[x, y], ...]} or "rect": [left, top, right, bottom]
                 (physical pixels; points: a freeform trace, closed back to its start)
@@ -52,6 +55,13 @@ widget, so a question about "this" can go straight to that window. A messaging w
 left out (mcp_servers/messaging.py). While the widget shows a pointer (desktop.py's point_at),
 "pointer_clear" says it has gone stale: a click or the wheel, another window to the front, or the
 pointed window moving, resizing, minimizing or closing.
+
+The highlighted text (2026-11-11): when push-to-talk starts, and when the typing card is about to
+take the keyboard ("selection"), the window in front is asked to copy its selection with
+Ctrl+Insert, the text is read off the clipboard and the clipboard is put back as it was. The next
+"foreground" reply carries it, for that same window only. Keys typed while the typing card waits
+for it are held back and re-sent once the widget has the keyboard ("release_keys"), so nothing
+typed lands in the app, where it would replace the highlighted text.
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -293,9 +303,11 @@ class PushToTalk:
 
     def _threshold(self):
         with self.lock:
-            if self.state == self.PENDING:
-                self.state = self.HOLDING
-                emit(event="hold")
+            if self.state != self.PENDING:
+                return
+            self.state = self.HOLDING
+            emit(event="hold")
+        selection.request(Selection.WAIT_VOICE_S)  # what he highlighted, while that app is still in front
 
     def _target_down(self, vk=0):
         """Under the lock: the talk key or button went down. Returns True to swallow it."""
@@ -530,6 +542,19 @@ user32.CreateWindowExW.restype = wt.HWND
 user32.DestroyWindow.argtypes = [wt.HWND]
 
 
+def _clipboard_owner():
+    """The clipboard needs an owner window for SetClipboardData; a message-only one is enough."""
+    return user32.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, HWND_MESSAGE, None, None, None)
+
+
+def _open_clipboard(owner, tries=20):
+    for _ in range(tries):  # another app may have it open for a moment
+        if user32.OpenClipboard(owner):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def put_image_on_clipboard(image):
     """Copy an image the way the Snipping Tool does: PNG (which latest_screenshot reads first)
     plus a DIB for apps that only paste bitmaps. Done here because Electron's clipboard.writeImage
@@ -539,14 +564,9 @@ def put_image_on_clipboard(image):
     image.save(png, "PNG")
     image.convert("RGB").save(dib, "DIB")
     formats = ((user32.RegisterClipboardFormatW("PNG"), png.getvalue()), (CF_DIB, dib.getvalue()))
-    # The clipboard needs an owner window for SetClipboardData; a message-only one is enough.
-    owner = user32.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, HWND_MESSAGE, None, None, None)
+    owner = _clipboard_owner()
     try:
-        for _ in range(20):  # another app may have it open for a moment
-            if user32.OpenClipboard(owner):
-                break
-            time.sleep(0.05)
-        else:
+        if not _open_clipboard(owner):
             raise OSError("the clipboard is busy")
         try:
             user32.EmptyClipboard()
@@ -617,7 +637,7 @@ def run_hook():
             try:
                 if not kb.flags & LLKHF_INJECTED:
                     snip.key(w_param, kb)  # watches only; never swallows
-                if ptt.handle(w_param, kb):
+                if ptt.handle(w_param, kb) or keyhold.key(w_param, kb):
                     return 1
             except Exception as exc:  # never let an error kill keyboard input
                 emit(event="log", message=f"hook error: {type(exc).__name__}")
@@ -805,6 +825,331 @@ def foreground_info(hwnd=None):
     return {"title": "" if messaging else title[:200], "process": process, "messaging": messaging, "desktop": False}
 
 
+def reply_foreground(reply_id):
+    """The "foreground" reply, with the text highlighted in that window. A read push-to-talk
+    started goes with this request, so it is waited for."""
+    selection.wait(Selection.WAIT_VOICE_S + 0.2)
+    try:
+        info = foreground_info()
+        if info:
+            info["selection"] = selection.current(_last_other)
+    except Exception as exc:
+        info = {}
+        emit(event="log", message=f"foreground failed: {type(exc).__name__}")
+    emit(event="foreground", id=reply_id, **info)
+
+
+# --- The highlighted text, for widget requests (2026-11-11) -------------------------------------
+# "What does this mean?" often means the text Bhanu has highlighted. Ctrl+Insert copies it in the
+# apps he uses (browsers, PDF viewers, Office, VS Code) and, unlike Ctrl+C, never stops a program
+# in a terminal when nothing is highlighted. The clipboard is copied aside first and put back
+# after, so a snip waiting there for latest_screenshot stays. Windows' clipboard history may still
+# keep the copied text: the app wrote it, not this process.
+CF_BITMAP, CF_METAFILEPICT, CF_PALETTE, CF_UNICODETEXT, CF_ENHMETAFILE = 2, 3, 9, 13, 14
+REMADE_BY_WINDOWS = {CF_BITMAP, CF_METAFILEPICT, CF_PALETTE}  # from the DIB or the enhanced metafile
+VK_INSERT, SCAN_INSERT, SCAN_CONTROL = 0x2D, 0x52, 0x1D
+TERMINALS = {"windowsterminal.exe", "openconsole.exe", "conhost.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+             "mintty.exe", "wezterm-gui.exe", "alacritty.exe", "putty.exe", "kitty.exe", "hyper.exe", "tabby.exe"}
+SELECTION_MAX_CHARS = 20000  # read at most this much; the widget sends less
+CLIPBOARD_MAX_BYTES = 64 << 20  # a bigger clipboard isn't copied aside, and then nothing is read
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+gdi32.CopyEnhMetaFileW.argtypes = [wt.HANDLE, wt.LPCWSTR]
+gdi32.CopyEnhMetaFileW.restype = wt.HANDLE
+gdi32.DeleteEnhMetaFile.argtypes = [wt.HANDLE]
+user32.EnumClipboardFormats.argtypes = [wt.UINT]
+user32.EnumClipboardFormats.restype = wt.UINT
+user32.GetClipboardData.argtypes = [wt.UINT]
+user32.GetClipboardData.restype = wt.HANDLE
+kernel32.GlobalSize.argtypes = [wt.HGLOBAL]
+kernel32.GlobalSize.restype = ctypes.c_size_t
+EXCLUDE_FROM_HISTORY = user32.RegisterClipboardFormatW("ExcludeClipboardContentFromMonitorProcessing")
+CHROMIUM_CUSTOM_DATA = user32.RegisterClipboardFormatW("Chromium Web Custom MIME Data Format")
+
+
+def _global_bytes(handle, limit=None):
+    size = kernel32.GlobalSize(handle)
+    p = kernel32.GlobalLock(handle)
+    if not p:
+        return None
+    try:
+        return ctypes.string_at(p, size if limit is None else min(size, limit))
+    finally:
+        kernel32.GlobalUnlock(handle)
+
+
+def _discard(saved):
+    for fmt, data in saved:
+        if fmt == CF_ENHMETAFILE:
+            gdi32.DeleteEnhMetaFile(data)
+
+
+def save_clipboard():
+    """With the clipboard open: everything on it, for restore_clipboard; None when something on
+    it couldn't be put back, and then the selection isn't read."""
+    saved, total, fmt = [], 0, 0
+    while True:
+        fmt = user32.EnumClipboardFormats(fmt)
+        if not fmt:
+            return saved
+        if fmt in REMADE_BY_WINDOWS:
+            continue
+        if 0x80 <= fmt <= 0x8E or 0x200 <= fmt <= 0x3FF:  # owner-drawn, private and GDI-object formats
+            _discard(saved)
+            return None
+        handle = user32.GetClipboardData(fmt)
+        if not handle:
+            continue  # offered, but the app never supplied it
+        if fmt == CF_ENHMETAFILE:
+            copy = gdi32.CopyEnhMetaFileW(handle, None)
+            if copy:
+                saved.append((fmt, copy))
+            continue
+        data = _global_bytes(handle)
+        total += len(data or b"")
+        if data is None or total > CLIPBOARD_MAX_BYTES:
+            _discard(saved)
+            return None
+        saved.append((fmt, data))
+
+
+def restore_clipboard(saved):
+    """With the clipboard open: what save_clipboard copied aside, in place of what is there now,
+    marked so clipboard history and clipboard managers don't take it for a new copy."""
+    user32.EmptyClipboard()
+    for fmt, data in saved + ([(EXCLUDE_FROM_HISTORY, b"\0")] if saved else []):
+        if fmt == CF_ENHMETAFILE:
+            if not user32.SetClipboardData(fmt, data):
+                gdi32.DeleteEnhMetaFile(data)
+            continue
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, max(len(data), 1))
+        if not handle:
+            continue
+        if data:
+            ctypes.memmove(kernel32.GlobalLock(handle), data, len(data))
+            kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(fmt, handle):  # on success the clipboard owns it
+            kernel32.GlobalFree(handle)
+
+
+def empty_line_copy(blob):
+    """VS Code copies the whole line when nothing is highlighted, and says so in its own clipboard
+    data, which Chromium keeps as UTF-16 strings."""
+    return '"isFromEmptySelection":true' in blob.decode("utf-16-le", "ignore")
+
+
+def clipboard_text():
+    """With the clipboard open: its text, up to SELECTION_MAX_CHARS."""
+    if user32.IsClipboardFormatAvailable(CHROMIUM_CUSTOM_DATA):
+        blob = user32.GetClipboardData(CHROMIUM_CUSTOM_DATA)
+        if blob and empty_line_copy(_global_bytes(blob, 1 << 16) or b""):
+            return ""
+    handle = user32.GetClipboardData(CF_UNICODETEXT)
+    data = _global_bytes(handle, (SELECTION_MAX_CHARS + 1) * 2) if handle else None
+    return data.decode("utf-16-le", "replace").split("\0", 1)[0] if data else ""
+
+
+def selection_skip(hwnd):
+    """Why the selection in hwnd isn't read, or None."""
+    if not hwnd:
+        return "none"
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if pid.value == WIDGET_PID:
+        return "widget"
+    cls = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, cls, 64)
+    if cls.value in TASKBAR_CLASSES or cls.value in DESKTOP_CLASSES:
+        return "desktop"
+    process = _process(hwnd)
+    if process.lower() in TERMINALS:
+        return "terminal"  # Ctrl+Insert would reach the shell when nothing is highlighted
+    if is_messaging(_title(hwnd), process):
+        return "messaging"
+    if _fullscreen:
+        return "fullscreen"
+    if modifier_down():
+        return "modifier"  # Shift+Insert pastes
+    if snip.watch.is_set() or snip.state == SnipGesture.ARMED:
+        return "snip"  # a snip is on its way to the clipboard
+    return None
+
+
+def _ctrl_insert():
+    return (_key(VK_CONTROL, SCAN_CONTROL), _key(VK_INSERT, SCAN_INSERT, extended=True),
+            _key(VK_INSERT, SCAN_INSERT, up=True, extended=True), _key(VK_CONTROL, SCAN_CONTROL, up=True))
+
+
+class Selection:
+    """The text highlighted in the window in front, read when push-to-talk starts (WAIT_VOICE_S:
+    the request comes seconds later) or the typing card opens (WAIT_TYPING_S: the widget waits for
+    it before taking the keyboard), and kept KEEP_S for the next request from that window. One
+    read at a time, on its own thread, never in a hook: SendInput waits for every hook, this
+    process's own included."""
+    WAIT_VOICE_S, WAIT_TYPING_S, LATE_S, KEEP_S = 1.0, 0.25, 1.0, 120
+
+    def __init__(self):
+        self.enabled = True
+        self.lock = threading.Lock()
+        self.settled = threading.Condition(self.lock)
+        self.pending = 0
+        self.jobs = queue.Queue()
+        self.text, self.hwnd, self.at = "", None, 0.0
+
+    def request(self, wait_s, reply_id=None):
+        if not self.enabled:
+            if reply_id:
+                emit(event="selection", id=reply_id, chars=0)
+            return
+        with self.lock:
+            self.pending += 1
+        self.jobs.put((wait_s, reply_id))
+
+    def wait(self, timeout):
+        """Until no read is waiting or under way."""
+        with self.lock:
+            return self.settled.wait_for(lambda: self.pending == 0, timeout)
+
+    def keep(self, hwnd, text):
+        with self.lock:
+            self.hwnd, self.text, self.at = hwnd, text, time.monotonic()
+
+    def current(self, hwnd):
+        """What was read last, if it was read in hwnd within KEEP_S."""
+        with self.lock:
+            fresh = hwnd is not None and self.hwnd == hwnd and time.monotonic() - self.at < self.KEEP_S
+            return self.text if fresh else ""
+
+    def run(self):
+        while True:
+            wait_s, reply_id = self.jobs.get()
+            replied = []
+
+            def reply(chars):
+                if reply_id and not replied:
+                    replied.append(True)
+                    emit(event="selection", id=reply_id, chars=chars)
+            try:
+                self.read(wait_s, reply)
+            except Exception as exc:
+                emit(event="log", message=f"selection read failed: {type(exc).__name__}")
+            finally:
+                reply(0)
+                with self.lock:
+                    self.pending -= 1
+                    self.settled.notify_all()
+
+    def read(self, wait_s, reply):
+        """Copy what is highlighted in the window in front, keep its text and put the clipboard
+        back. reply(chars) as soon as the text is read, or after wait_s when nothing came (most
+        apps copy nothing when nothing is highlighted); a copy arriving later, up to LATE_S, is
+        still kept and put back. Returns why nothing was read, or None."""
+        hwnd = user32.GetForegroundWindow()
+        skip = selection_skip(hwnd)
+        if skip:
+            if skip != "widget":  # the widget in front: what was read before it took the keyboard stands
+                self.keep(hwnd, "")
+            return skip
+        self.keep(hwnd, "")
+        owner = _clipboard_owner()
+        try:
+            if not _open_clipboard(owner):
+                return "busy"
+            try:
+                saved = save_clipboard()
+            finally:
+                user32.CloseClipboard()
+            if saved is None:
+                return "clipboard"
+            seq = user32.GetClipboardSequenceNumber()
+            send_keys(*_ctrl_insert())
+            start = time.monotonic()
+            while user32.GetClipboardSequenceNumber() == seq:
+                waited = time.monotonic() - start
+                if waited >= wait_s:
+                    reply(0)
+                if waited >= self.LATE_S:
+                    _discard(saved)
+                    return None  # nothing highlighted
+                time.sleep(0.01)
+            time.sleep(0.03)  # the app writes its formats one after another
+            if not _open_clipboard(owner, tries=40):
+                _discard(saved)
+                emit(event="log", message="selection: the clipboard stayed busy and keeps the copied text")
+                return "busy"
+            try:
+                text = clipboard_text()
+                restore_clipboard(saved)
+            finally:
+                user32.CloseClipboard()
+            with snip.lock:  # a Win+Shift+S pressed meanwhile waits for its own image, not this one
+                if snip.watch.is_set():
+                    snip.watch_seq = user32.GetClipboardSequenceNumber()
+            self.keep(hwnd, text)
+            reply(len(text))
+            return None
+        finally:
+            user32.DestroyWindow(owner)
+
+
+selection = Selection()
+
+
+class KeyHold:
+    """Keys typed while the typing card waits for the selection: held back, then re-sent once the
+    widget has the keyboard (release_keys), so none lands in the app in front, where typing would
+    replace the highlighted text. Dropped if the widget hasn't taken the keyboard within LIMIT_S."""
+    LIMIT_S = 2.0
+
+    def __init__(self):
+        self.active = False
+        self.lock = threading.Lock()
+        self.downs = set()
+        self.keys = []
+        self.timer = None
+
+    def start(self):
+        with self.lock:
+            self.active, self.downs, self.keys = True, set(), []
+            if self.timer:
+                self.timer.cancel()
+            self.timer = threading.Timer(self.LIMIT_S, self.release, kwargs={"replay": False})
+            self.timer.daemon = True
+            self.timer.start()
+
+    def key(self, msg, kb):
+        """From the keyboard hook: True to hold the event back. Returns at once when not holding."""
+        if not self.active or kb.flags & LLKHF_INJECTED:
+            return False
+        down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        k = (kb.vkCode, kb.scanCode, bool(kb.flags & LLKHF_EXTENDED))
+        with HookLock(self.lock) as held:
+            if not held or not self.active:
+                return False
+            if down:
+                self.downs.add(k)
+            elif k not in self.downs:
+                return False  # pressed before the hold began: its release goes where its press went
+            self.keys.append(_key(k[0], k[1], up=not down, extended=k[2]))
+            return True
+
+    def release(self, replay=True):
+        with self.lock:
+            if not self.active:
+                return
+            self.active = False
+            keys, self.keys = self.keys, []
+            if self.timer:
+                self.timer.cancel()
+                self.timer = None
+        if keys and replay:
+            resend(*keys)
+        elif keys:
+            emit(event="log", message=f"{len(keys)} held-back key events dropped")
+
+
+keyhold = KeyHold()
+
+
 # --- A pointer the widget shows (desktop.py's point_at, 2026-11-11) ----------------------------
 RECT = wt.RECT
 user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
@@ -962,12 +1307,13 @@ def run_commands():
         elif cmd.get("cmd") == "restore_focus":
             restore_focus()
         elif cmd.get("cmd") == "foreground":
-            try:
-                info = foreground_info()
-            except Exception as exc:
-                info = {}
-                emit(event="log", message=f"foreground failed: {type(exc).__name__}")
-            emit(event="foreground", id=cmd.get("id"), **info)
+            threading.Thread(target=reply_foreground, args=(cmd.get("id"),), daemon=True).start()
+        elif cmd.get("cmd") == "selection":
+            if selection.enabled and HOOKS:
+                keyhold.start()
+            selection.request(Selection.WAIT_TYPING_S, cmd.get("id") or "-")
+        elif cmd.get("cmd") == "release_keys":
+            keyhold.release(replay=cmd.get("replay") is not False)
         elif cmd.get("cmd") == "pointer":
             hwnd = cmd.get("hwnd")
             pointer.show(hwnd if isinstance(hwnd, int) else None)
@@ -975,6 +1321,8 @@ def run_commands():
             ptt.configure(cmd.get("talk"), cmd.get("hold_ms"))
             if "snip" in cmd:
                 snip.enabled = cmd["snip"] is not False
+            if "selection" in cmd:
+                selection.enabled = cmd["selection"] is not False
             _hook_jobs.put(None)
         elif cmd.get("cmd") == "grab":
             threading.Thread(target=grab, args=(cmd,), daemon=True).start()
@@ -1025,7 +1373,9 @@ def main():
         start = {}
     ptt.configure(start.get("talk"), start.get("hold_ms"))
     snip.enabled = start.get("snip", True) is not False
+    selection.enabled = start.get("selection", True) is not False
     threading.Thread(target=run_resends, daemon=True).start()
+    threading.Thread(target=selection.run, daemon=True).start()
     if HOOKS:
         threading.Thread(target=run_hook, daemon=True).start()
         mouse_hook.sync(mouse_wanted())

@@ -189,7 +189,7 @@ function ask(text, kind) {
 }
 
 function showAnswer(a, streaming) {
-  echo.textContent = a.request;
+  echo.textContent = a.selected ? `${a.request} · with the highlighted text` : a.request;
   body.className = streaming ? 'body streaming' : 'body';
   body.innerHTML = renderMarkdown(a.text.trimStart()); // replies often open with blank lines
   if (view !== 'answer') setView('answer');
@@ -409,7 +409,11 @@ function closeTyping() {
   window.twin.releaseFocus();
 }
 
-window.twin.onFocusGranted(() => { if (view === 'typing') input.focus(); });
+// Then keys typed while the highlighted text was being read come through (main.js wantFocus).
+window.twin.onFocusGranted(() => {
+  if (view === 'typing') input.focus();
+  window.twin.focused();
+});
 window.twin.onFocusLost(() => { if (view === 'typing') setView(current ? 'working' : 'rest'); });
 
 // On press, not click: a press on a pill that appeared under a still cursor makes it widen for
@@ -503,6 +507,7 @@ const holdVal = document.getElementById('hold-val');
 const micList = document.getElementById('mics');
 const autostart = document.getElementById('autostart');
 const snipSwitch = document.getElementById('snip');
+const selectionSwitch = document.getElementById('selection');
 let prefs = null; // the settings as the main process last returned them
 let micDevice = null; // the chosen microphone's current device id, or null for Windows' default
 
@@ -516,6 +521,7 @@ function showPrefs() {
   holdVal.textContent = seconds(prefs.hold_ms);
   autostart.setAttribute('aria-checked', String(Boolean(prefs.start_with_windows)));
   snipSwitch.setAttribute('aria-checked', String(prefs.snip !== false));
+  selectionSwitch.setAttribute('aria-checked', String(prefs.selection !== false));
 }
 
 async function listMics() {
@@ -595,6 +601,11 @@ autostart.addEventListener('click', async () => {
 
 snipSwitch.addEventListener('click', async () => {
   prefs = await window.twin.setSettings({ snip: prefs.snip === false });
+  showPrefs();
+});
+
+selectionSwitch.addEventListener('click', async () => {
+  prefs = await window.twin.setSettings({ selection: prefs.selection === false });
   showPrefs();
 });
 
@@ -751,6 +762,12 @@ window.twin.onSnip(() => {
   ask('Your snip', 'snip');
 });
 window.twin.onSnipError((message) => showError(message));
+
+// The request went with the text he had highlighted (main.js withSelection).
+window.twin.onSelection(({ id }) => {
+  const a = answers.get(id);
+  if (a) a.selected = true;
+});
 
 window.twin.onTranscript(({ id, ok, text, error }) => {
   if (superseded.delete(id)) return;

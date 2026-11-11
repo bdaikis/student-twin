@@ -163,6 +163,22 @@ to click. The ring never clicks anything, and clicks pass straight through it. I
 click or scroll, switch to another window, move the window, ask again, or after 12 seconds. Only
 requests from the widget show it, not Telegram. Restart Hermes and the widget after updating.
 
+### Ask about highlighted text
+
+Highlight text with the mouse, then hold the talk key and say "explain this" (or "translate this",
+"is this right?"), or click the widget and type the question. The highlighted text goes with the
+request, and the answer card shows *with the highlighted text*. The widget copies it with
+Ctrl+Insert the moment you start talking or open the typing card, reads it, and puts the clipboard
+back as it was, so a snip waiting there stays. Windows' clipboard history (Win+V) may still keep the
+copied text. Up to 6,000 characters go with a request.
+
+It isn't read in terminals (Ctrl+Insert would reach the shell), messaging or email windows,
+full-screen apps, or while Shift, Ctrl, Alt or Win is held. VS Code copies the whole line when
+nothing is highlighted; that copy is ignored. Keys typed in the moment before the typing card takes
+the keyboard are held back and typed into it, so they never land on the highlighted text. It also
+works from a second computer, since only the text is sent. Turn it off with *Highlighted text goes
+with questions* in the settings.
+
 ### Moving to another computer
 
 `scripts\transfer_state.py export <folder>` copies the twin's settings (shared rules, memory, the

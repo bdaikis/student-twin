@@ -206,7 +206,31 @@ function showError(message, request = '') {
   collapseIn(ERROR_MS);
 }
 
+// The model service is busy and Hermes is retrying (main.js providerRetry): a countdown in the
+// working pill in place of the request, until the answer starts or the request ends.
+let retryTimer = null;
+function stopRetry() {
+  if (!retryTimer) return;
+  clearInterval(retryTimer);
+  retryTimer = null;
+  const a = current && answers.get(current);
+  if (a && view === 'working') line.textContent = a.request;
+}
+
+window.twin.onStatus(({ id, wait_s, cycle, total }) => {
+  if (id !== current) return;
+  stopRetry();
+  const until = Date.now() + wait_s * 1000;
+  const show = () => {
+    const left = Math.ceil((until - Date.now()) / 1000);
+    line.textContent = left > 0 ? `Service busy, retrying in ${left} s (${cycle}/${total})` : `Service busy, retrying now (${cycle}/${total})`;
+  };
+  show();
+  retryTimer = setInterval(show, 1000);
+});
+
 window.twin.onDelta(({ id, text }) => {
+  if (id === current) stopRetry();
   const a = answers.get(id);
   if (!a) return;
   a.text += text;
@@ -223,6 +247,7 @@ function readingTime(text) {
 }
 
 window.twin.onDone(({ id, cancelled }) => {
+  if (id === current) stopRetry();
   const a = answers.get(id);
   answers.delete(id);
   if (id === current) current = null;
@@ -257,6 +282,7 @@ window.twin.onDone(({ id, cancelled }) => {
 });
 
 window.twin.onError(({ id, message }) => {
+  if (id === current) stopRetry();
   const a = answers.get(id);
   answers.delete(id);
   if (id === current) current = null;

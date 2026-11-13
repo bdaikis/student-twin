@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('twin', {
   onSnipError: (cb) => ipcRenderer.on('snip:error', (_e, message) => cb(message)),
   cancel: (id) => ipcRenderer.send('twin:cancel', { id }),
   onDelta: (cb) => ipcRenderer.on('twin:delta', (_e, m) => cb(m)),
+  onStatus: (cb) => ipcRenderer.on('twin:status', (_e, m) => cb(m)),
   onDone: (cb) => ipcRenderer.on('twin:done', (_e, m) => cb(m)),
   onError: (cb) => ipcRenderer.on('twin:error', (_e, m) => cb(m)),
   onMic: (cb) => ipcRenderer.on('mic', (_e, action) => cb(action)),

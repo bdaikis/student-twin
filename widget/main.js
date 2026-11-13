@@ -398,6 +398,14 @@ function clockLine() {
   return `The current local time is ${when} (Malaysia, UTC+08:00); trust it over any date elsewhere in your context.`;
 }
 
+// When the model provider is overloaded (HTTP 503; 13 Nov 2026), Hermes retries in rounds and says so
+// in a hermes.status event: "Provider temporarily unavailable — retrying automatically in 36s
+// (cycle 2/5)". The widget shows it as a countdown instead of an unexplained wait.
+function providerRetry(status) {
+  const m = /temporarily unavailable.*?retrying automatically in (\d+)s \(cycle (\d+)\/(\d+)\)/i.exec(status?.text || '');
+  return m ? { wait_s: Number(m[1]), cycle: Number(m[2]), total: Number(m[3]) } : null;
+}
+
 // Stream one answer from Hermes, forwarding text deltas to the renderer as they arrive.
 async function ask(sender, id, text, kind) {
   hidePointer(); // a new question: the last answer's pointer is done with
@@ -435,6 +443,7 @@ async function ask(sender, id, text, kind) {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let event = null; // the SSE frame's event name; plain chat chunks have none
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -443,9 +452,16 @@ async function ask(sender, id, text, kind) {
       while ((nl = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, nl).trim();
         buffer = buffer.slice(nl + 1);
+        if (!line) { event = null; continue; }
+        if (line.startsWith('event:')) { event = line.slice(6).trim(); continue; }
         if (!line.startsWith('data:')) continue;
         const data = line.slice(5).trim();
         if (data === '[DONE]') continue;
+        if (event === 'hermes.status') {
+          const retry = providerRetry(JSON.parse(data));
+          if (retry) sender.send('twin:status', { id, ...retry });
+          continue;
+        }
         const delta = JSON.parse(data).choices?.[0]?.delta?.content;
         if (delta) sender.send('twin:delta', { id, text: delta });
       }
